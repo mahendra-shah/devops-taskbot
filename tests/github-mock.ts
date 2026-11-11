@@ -77,7 +77,7 @@ export class MockGitHubProvider implements GitHubProvider {
       body: `${task.body}\n\n---\n📎 **Slack thread:** channel=${slackChannelId} ts=${slackMessageTs}`,
       url: `https://github.com/${config.github.owner || 'org'}/${config.github.repo || 'devops-tasks'}/issues/${num}`,
       state: 'open',
-      labels: ['devops', task.priority, `effort:${task.estimate}`],
+      labels: ['devops', 'bot-created', task.priority, `effort:${task.estimate}`],
       assignees: [assigneeGithubUsername],
       createdAt: now,
       updatedAt: now,
@@ -116,6 +116,18 @@ export class MockGitHubProvider implements GitHubProvider {
     issue.assignees = [newAssignee];
     issue.updatedAt = new Date().toISOString();
     console.log(`✓ [MockGitHub] Issue #${issueNumber} reassigned → @${newAssignee}`);
+    return { ...issue };
+  }
+
+  async updateIssueMeta(
+    issueNumber: number,
+    meta: { priority?: 'P0' | 'P1' | 'P2'; estimate?: 'low' | 'medium' | 'high' }
+  ): Promise<GitHubIssue | null> {
+    const issue = this.issues.find(i => i.number === issueNumber);
+    if (!issue) return null;
+    if (meta.priority) issue.labels = issue.labels.filter(l => !['P0', 'P1', 'P2'].includes(l)).concat(meta.priority);
+    if (meta.estimate) issue.labels = issue.labels.filter(l => !l.startsWith('effort:')).concat(`effort:${meta.estimate}`);
+    issue.updatedAt = new Date().toISOString();
     return { ...issue };
   }
 

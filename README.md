@@ -23,6 +23,9 @@
 - **P0 Escalation**: An un-acknowledged P0 escalates at 30 / 60 / 120 min (assignee → every available dev → everyone + `@here`). Any 👀/reaction/thread reply or status change stops it.
 - **Repeat-Request Detection**: The same kind of request 3× in 30 days → one note in the channel suggesting automation or a runbook.
 - **Audit Trail**: Every create / status change / reassignment / escalation is logged in SQLite **and** commented on the GitHub issue (who, via what, and why this assignee).
+- **Project Board Sync**: Keeps your GitHub Projects board (Status + Priority) in step with the bot's labels, so the board never says "Todo" for something in progress. Optional — see `GITHUB_PROJECT_NUMBER`.
+- **Bot-vs-human markers**: Because the bot uses your GitHub token, its actions are marked: `bot-created` label, a "Created by the DevOps bot on behalf of …" footer, 🤖 audit comments, and "posted by the DevOps bot on behalf of …" on notes it writes. Anything without a marker was done by a person directly on GitHub.
+- **Structured issues**: Every issue has Request / Context / Definition of done, the requester's name, and the original Slack message (collapsed).
 - **Weekly Report by Email**: Friday 18:00 — completed/opened/open counts, per-dev handled work + average resolution time, top requesters, repeat topics. Sent with nodemailer (not posted to Slack).
 - **Survives Restarts**: No-reply timers, thread↔issue links and escalation watches are stored in SQLite (`./data/devops-tracker.db`).
 - **Terminal Simulator (No Slack Needed)**: Test everything interactively from your terminal with `npm run chat`!
@@ -105,6 +108,9 @@ Inside the CLI chat:
 ```bash
 # Fast offline test suite — original 8 scenarios + 91 feature checks, zero API quota
 npm test
+
+# Read-only check that the bot can see your GitHub Project board and how it maps Status/Priority
+npm run check:board
 
 # Only the newer features (OOO, escalation, requester updates, audit, report, …)
 npm run test:features

@@ -14,6 +14,7 @@ import {
   startSLAChecker,
 } from './scheduler.js';
 import { AuditedGitHubProvider } from './audit.js';
+import { liveProjectBoard } from './projectBoard.js';
 import { availabilityService, describeAvailability, profileFromSlackUser } from './availability.js';
 import { ackThread, startEscalationChecker } from './escalation.js';
 import { startClosurePoller } from './requesterUpdates.js';
@@ -130,7 +131,13 @@ export async function startSlackBot(): Promise<void> {
 
   // Every create / status change / reassignment made through this provider is audited
   // (SQLite log + a comment on the GitHub issue).
-  const github = new AuditedGitHubProvider(liveGitHubProvider);
+  // Also keeps the GitHub Projects board (Status / Priority) in step with the labels.
+  const github = new AuditedGitHubProvider(liveGitHubProvider, { board: liveProjectBoard });
+  console.log(
+    liveProjectBoard.enabled
+      ? `✓ Project board sync ON (project #${config.github.project.number})`
+      : 'ℹ️ Project board sync OFF — set GITHUB_PROJECT_NUMBER (token needs the `project` scope) to enable it.'
+  );
   const bot = new DevOpsBot(github);
 
   // Out-of-office detection reads the Slack profile (status, display name, full name).

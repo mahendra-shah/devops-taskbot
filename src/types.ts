@@ -73,6 +73,11 @@ export interface GitHubProvider {
   ): Promise<GitHubIssue>;
   updateIssueStatus(issueNumber: number, status: IssueStatus): Promise<GitHubIssue | null>;
   reassignIssue(issueNumber: number, newAssignee: string): Promise<GitHubIssue | null>;
+  /** Change the P0/P1/P2 and/or effort:* label of an existing issue (replaces the old one). */
+  updateIssueMeta(
+    issueNumber: number,
+    meta: { priority?: 'P0' | 'P1' | 'P2'; estimate?: 'low' | 'medium' | 'high' }
+  ): Promise<GitHubIssue | null>;
   addIssueComment(issueNumber: number, comment: string): Promise<void>;
   addIssueLabel(issueNumber: number, label: string): Promise<void>;
   getIssueByNumber(issueNumber: number): Promise<GitHubIssue | null>;

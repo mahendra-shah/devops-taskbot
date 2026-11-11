@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import * as store from './store.js';
 import type { GitHubIssue, GitHubProvider, IssueStatus, ParsedTask } from './types.js';
+import type { BoardSync } from './projectBoard.js';
 
 /**
  * Audit trail.
@@ -39,6 +40,17 @@ export function setAssignmentNote(note: string): void {
 }
 
 export const AUDIT_MARKER = '🤖 **DevOps Tracker — audit trail**';
+
+/**
+ * Everything the bot does on GitHub is made with a human's token, so it shows up under that person's name.
+ * These markers make bot actions recognisable: audit comments, "posted by the bot" comments, the body footer
+ * and the `bot-created` label. Anything WITHOUT a marker was done by a human directly on GitHub.
+ */
+export const BOT_NOTE_MARKER = '🤖 _Posted by the DevOps bot';
+
+function actorLabel(ctx?: AuditContext): string {
+  return ctx?.actorName || ctx?.actorId || 'a teammate';
+}
 
 function who(ctx?: AuditContext): string {
   if (!ctx?.actorId && !ctx?.actorName) return 'the bot (automatic)';
@@ -98,7 +110,15 @@ const STATUS_LABEL: Record<IssueStatus, string> = {
  * Decorator: delegates to the real provider and audits every mutation.
  */
 export class AuditedGitHubProvider implements GitHubProvider {
-  constructor(private readonly inner: GitHubProvider) {}
+  constructor(
+    private readonly inner: GitHubProvider,
+    private readonly opts: { board?: BoardSync } = {}
+  ) {}
+
+  private async syncBoard(issue: GitHubIssue | null): Promise<void> {
+    if (!issue || !this.opts.board) return;
+    await this.opts.board.sync(issue); // best effort; the board implementation never throws
+  }
 
   get isMock(): boolean {
     return this.inner.isMock;
@@ -120,7 +140,9 @@ export class AuditedGitHubProvider implements GitHubProvider {
     slackMessageTs: string,
     slackChannelId: string
   ): Promise<GitHubIssue> {
-    const issue = await this.inner.createIssue(task, assigneeGithubUsername, slackMessageTs, slackChannelId);
+    const ctxForBody = als.getStore();
+    const footer = `\n\n> 🤖 Created by the **DevOps bot** on behalf of **${actorLabel(ctxForBody)}** via Slack.`;
+    const issue = await this.inner.createIssue({ ...task, body: task.body + footer }, assigneeGithubUsername, slackMessageTs, slackChannelId);
     const ctx = als.getStore();
     logAudit('issue.created', {
       issueNumber: issue.number,
@@ -133,6 +155,7 @@ export class AuditedGitHubProvider implements GitHubProvider {
     ];
     if (ctx?.assignmentNote) lines.push(`**Why this assignee:** ${ctx.assignmentNote}`);
     await postAuditComment(this.inner, issue.number, lines);
+    await this.syncBoard(issue);
     return issue;
   }
 
@@ -145,6 +168,7 @@ export class AuditedGitHubProvider implements GitHubProvider {
       `**Action:** status → **${STATUS_LABEL[status]}**`,
       `**By:** ${who(ctx)}${ctx?.via ? ` — ${ctx.via}` : ''}`,
     ]);
+    await this.syncBoard(updated);
     return updated;
   }
 
@@ -162,10 +186,32 @@ export class AuditedGitHubProvider implements GitHubProvider {
     return updated;
   }
 
+  async updateIssueMeta(
+    issueNumber: number,
+    meta: { priority?: 'P0' | 'P1' | 'P2'; estimate?: 'low' | 'medium' | 'high' }
+  ): Promise<GitHubIssue | null> {
+    const before = await this.inner.getIssueByNumber(issueNumber);
+    const updated = await this.inner.updateIssueMeta(issueNumber, meta);
+    if (!updated) return null;
+    const ctx = als.getStore();
+    const pick = (i: GitHubIssue | null, test: (l: string) => boolean) => i?.labels.find(test) ?? 'none';
+    const lines: string[] = [];
+    if (meta.priority) lines.push(`**Priority:** ${pick(before, l => /^P[012]$/.test(l))} → **${meta.priority}**`);
+    if (meta.estimate) lines.push(`**Effort:** ${pick(before, l => l.startsWith('effort:')).replace('effort:', '')} → **${meta.estimate}**`);
+    logAudit('issue.meta', { issueNumber, detail: `${lines.join('; ').replace(/\*/g, '')}; via ${ctx?.via ?? 'bot'}` });
+    await postAuditComment(this.inner, issueNumber, [...lines, `**By:** ${who(ctx)}${ctx?.via ? ` — ${ctx.via}` : ''}`]);
+    await this.syncBoard(updated);
+    return updated;
+  }
+
   async addIssueComment(issueNumber: number, comment: string): Promise<void> {
-    await this.inner.addIssueComment(issueNumber, comment);
-    if (!comment.startsWith(AUDIT_MARKER)) {
-      logAudit('issue.comment', { issueNumber, detail: comment.slice(0, 200) });
+    if (comment.startsWith(AUDIT_MARKER) || comment.startsWith(BOT_NOTE_MARKER)) {
+      await this.inner.addIssueComment(issueNumber, comment);
+      return;
     }
+    // A note the bot writes on someone's behalf: label it so it isn't mistaken for the person's own comment.
+    const ctx = als.getStore();
+    await this.inner.addIssueComment(issueNumber, `${BOT_NOTE_MARKER} on behalf of ${actorLabel(ctx)}_\n\n${comment}`);
+    logAudit('issue.comment', { issueNumber, detail: comment.slice(0, 200) });
   }
 }

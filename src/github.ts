@@ -23,7 +23,7 @@ function mapOctokitIssue(issue: any): GitHubIssue {
 }
 
 function buildLabels(task: Pick<ParsedTask, 'priority' | 'estimate'>): string[] {
-  return ['devops', task.priority, `effort:${task.estimate}`];
+  return ['devops', 'bot-created', task.priority, `effort:${task.estimate}`];
 }
 
 export async function createIssue(
@@ -83,6 +83,19 @@ export async function updateIssueStatus(
   });
   console.log(`✓ Issue #${issueNumber} updated → status: ${status}`);
   return mapOctokitIssue(updated);
+}
+
+export async function updateIssueMeta(
+  issueNumber: number,
+  meta: { priority?: 'P0' | 'P1' | 'P2'; estimate?: 'low' | 'medium' | 'high' }
+): Promise<GitHubIssue | null> {
+  const { data: issue } = await octokit.rest.issues.get({ owner, repo, issue_number: issueNumber });
+  let labels = (issue.labels as any[]).map(l => (typeof l === 'string' ? l : l.name || ''));
+  if (meta.priority) labels = labels.filter(l => !['P0', 'P1', 'P2'].includes(l)).concat(meta.priority);
+  if (meta.estimate) labels = labels.filter(l => !l.startsWith('effort:')).concat(`effort:${meta.estimate}`);
+  const { data } = await octokit.rest.issues.update({ owner, repo, issue_number: issueNumber, labels });
+  console.log(`✓ Issue #${issueNumber} meta updated → ${[meta.priority, meta.estimate && `effort:${meta.estimate}`].filter(Boolean).join(', ')}`);
+  return mapOctokitIssue(data);
 }
 
 export async function reassignIssue(issueNumber: number, newAssignee: string): Promise<GitHubIssue | null> {
@@ -149,6 +162,7 @@ export async function ensureLabelsExist(): Promise<void> {
     { name: 'effort:medium', color: 'fef08a', description: 'Estimated 1-4 hours' },
     { name: 'effort:high', color: 'fecaca', description: 'Estimated > 4 hours' },
     { name: 'devops', color: '6366f1', description: 'DevOps task' },
+    { name: 'bot-created', color: '0e8a16', description: 'Issue was created by the DevOps bot from a Slack request' },
     { name: 'sla-breach-alerted', color: 'b60205', description: 'SLA breach notification already sent' },
   ];
 
@@ -264,6 +278,7 @@ export const liveGitHubProvider: GitHubProvider = {
   createIssue,
   updateIssueStatus,
   reassignIssue,
+  updateIssueMeta,
   addIssueComment,
   addIssueLabel,
   getIssueByNumber,

@@ -3,16 +3,18 @@ process.env.STATE_DB_PATH = ':memory:'; // tests never touch the real state DB
 
 import nodemailer from 'nodemailer';
 import { config } from '../src/config.js';
-import { DevOpsBot } from '../src/bot.js';
+import { DevOpsBot, type AgentRunner } from '../src/bot.js';
 import * as store from '../src/store.js';
-import { AuditedGitHubProvider, AUDIT_MARKER } from '../src/audit.js';
+import { AuditedGitHubProvider, AUDIT_MARKER, BOT_NOTE_MARKER, runWithAudit } from '../src/audit.js';
+import { deriveBoardValues, matchOption, STATUS_PATTERNS, PRIORITY_PATTERNS, type BoardSync } from '../src/projectBoard.js';
+import type { GitHubIssue } from '../src/types.js';
 import {
   availabilityService,
   evaluateAvailability,
   parseDateRange,
   type SlackProfileInfo,
 } from '../src/availability.js';
-import { chooseAssignee } from '../src/llm.js';
+import { chooseAssignee, composeIssueBody } from '../src/llm.js';
 import { runEscalationCheck } from '../src/escalation.js';
 import { runClosurePoll } from '../src/requesterUpdates.js';
 import { fallbackTopic } from '../src/topics.js';
@@ -500,6 +502,127 @@ async function testWeeklyReport() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// J. Changing priority / effort of an existing issue
+// ═══════════════════════════════════════════════════════════════════════════
+async function testPriorityChange() {
+  banner('J. Priority / effort changes: labels swap, audit comment, P0 escalation starts/stops');
+  store.resetDbForTests();
+  const mock = new MockGitHubProvider(false);
+  const github = new AuditedGitHubProvider(mock);
+
+  // Stand-in for the LLM tool call: "set priority P0" / "set effort high" inside an issue thread
+  const runner: AgentRunner = async params => {
+    const p = params.event.text.match(/set priority (P[012])/i);
+    const e = params.event.text.match(/set effort (low|medium|high)/i);
+    if ((p || e) && params.linkedIssue) {
+      const priority = p ? (p[1].toUpperCase() as 'P0' | 'P1' | 'P2') : undefined;
+      await params.github.updateIssueMeta(params.linkedIssue.number, { priority, estimate: e ? (e[1] as 'low' | 'medium' | 'high') : undefined });
+      return {
+        replyText: 'Updated.',
+        createdIssue: null,
+        priorityChanges: priority ? [{ issueNumber: params.linkedIssue.number, priority }] : [],
+      };
+    }
+    return mockAgentRunner(params);
+  };
+  const bot = new DevOpsBot(github, runner, { classifyTopic: async () => null });
+  const slack = new SimulatedSlackEnvironment(bot, github, true);
+  for (const m of config.team) slack.setProfile(m.slackId, { statusText: '', statusEmoji: '', statusExpiration: 0, displayName: m.githubUsername, realName: m.githubUsername });
+
+  const t = await slack.sendMessage({ ...REQ, text: '@bot please add a Grafana alert for disk usage' });
+  const labels = async () => (await mock.getIssueByNumber(1))!.labels;
+  assert((await labels()).includes('P2') && store.listP0Watches().length === 0, 'starts as P2, no escalation watch');
+
+  await slack.sendMessage({ userId: B, userName: 'dev-b', text: '@bot set priority P0', threadTs: t });
+  let l = await labels();
+  assert(l.includes('P0') && !l.includes('P2') && l.filter(x => /^P[012]$/.test(x)).length === 1, 'P2 → P0: old priority label replaced, exactly one priority label');
+  assert(store.listP0Watches().length === 1 && store.listP0Watches()[0].threadTs === t, 'raising to P0 starts escalation in the original thread');
+  assert(slack.capturedReplies.some(r => r.text.includes('P0 ALERT')), 'P0 alert posted to the assignee');
+
+  const audit = (await mock.getIssueByNumber(1))!.comments!.find(c => c.body.includes('Priority:'));
+  assert(Boolean(audit) && audit!.body.includes('P2 → **P0**') && audit!.body.includes('dev-b'), 'audit comment records P2 → P0 and who did it');
+
+  await runEscalationCheck(github, slack.createPoster(), Date.now() + 31 * 60_000);
+  assert(slack.capturedReplies.some(r => r.text.includes('P0 escalation 1/3')), 'the new P0 escalates like any other');
+
+  await slack.sendMessage({ userId: B, userName: 'dev-b', text: '@bot set priority P1', threadTs: t });
+  assert(store.listP0Watches().length === 0 && (await labels()).includes('P1'), 'lowering to P1 stops escalation');
+
+  await slack.sendMessage({ userId: B, userName: 'dev-b', text: '@bot set effort high', threadTs: t });
+  l = await labels();
+  assert(l.includes('effort:high') && l.filter(x => x.startsWith('effort:')).length === 1, 'effort swapped: exactly one effort label');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// K. Project board sync, "bot did this" markers, structured issue body
+// ═══════════════════════════════════════════════════════════════════════════
+async function testBoardAndMarkers() {
+  banner('K1. Board values + option matching adapt to whatever your board calls things');
+  const opt = (...names: string[]) => names.map((name, i) => ({ id: `o${i}`, name }));
+  const statusOf = (names: string[], v: 'open' | 'in-progress' | 'blocked' | 'done') => matchOption(opt(...names), STATUS_PATTERNS[v])?.name;
+  const prioOf = (names: string[], v: 'P0' | 'P1' | 'P2') => matchOption(opt(...names), PRIORITY_PATTERNS[v])?.name;
+
+  assert(deriveBoardValues({ state: 'open', labels: ['devops', 'in-progress', 'P1'] }).status === 'in-progress', 'in-progress label → board status in-progress');
+  assert(deriveBoardValues({ state: 'closed', labels: ['in-progress'] }).status === 'done', 'closed issue → done (beats stale labels)');
+  assert(deriveBoardValues({ state: 'open', labels: ['blocked', 'in-progress'] }).status === 'blocked', 'blocked wins over in-progress');
+  assert(deriveBoardValues({ state: 'open', labels: ['devops'] }).priority === null, 'no priority label → nothing to set');
+
+  const std = ['Todo', 'In Progress', 'Done'];
+  assert(statusOf(std, 'open') === 'Todo' && statusOf(std, 'in-progress') === 'In Progress' && statusOf(std, 'done') === 'Done', 'standard "Todo / In Progress / Done" board maps correctly');
+  const alt = ['Backlog', 'In review', 'Blocked', 'Shipped'];
+  assert(statusOf(alt, 'open') === 'Backlog' && statusOf(alt, 'blocked') === 'Blocked' && statusOf(alt, 'done') === 'Shipped', 'custom column names ("Backlog", "Blocked", "Shipped") map too');
+  assert(prioOf(['P0', 'P1', 'P2'], 'P0') === 'P0' && prioOf(['P0', 'P1', 'P2'], 'P2') === 'P2', 'priority options named P0/P1/P2');
+  const words = ['Critical', 'High', 'Medium', 'Low'];
+  assert(prioOf(words, 'P0') === 'Critical' && prioOf(words, 'P1') === 'High' && prioOf(words, 'P2') === 'Medium', 'priority options named Critical/High/Medium/Low');
+  assert(statusOf(['Alpha', 'Beta'], 'done') === undefined, 'unrecognised options → no match (bot warns instead of guessing)');
+
+  banner('K2. Every bot change is pushed to the board; comments are not');
+  const synced: GitHubIssue[] = [];
+  const board: BoardSync = { sync: async issue => void synced.push(issue) };
+  store.resetDbForTests();
+  const mock = new MockGitHubProvider(false);
+  const github = new AuditedGitHubProvider(mock, { board });
+  const bot = new DevOpsBot(github, mockAgentRunner, { classifyTopic: async () => null });
+  const slack = new SimulatedSlackEnvironment(bot, github, true);
+  for (const m of config.team) slack.setProfile(m.slackId, { statusText: '', statusEmoji: '', statusExpiration: 0, displayName: m.githubUsername, realName: m.githubUsername });
+
+  const t = await slack.sendMessage({ ...REQ, text: '@bot please add a Prometheus alert for pod restarts' });
+  assert(synced.length === 1 && synced[0].labels.includes('P2'), 'issue creation → board synced (with its labels)');
+  await slack.react(t, 'eyes', B);
+  assert(synced.length === 2 && deriveBoardValues(synced[1]).status === 'in-progress', '👀 → board card moves to In Progress');
+  await github.updateIssueMeta(1, { priority: 'P0' });
+  assert(synced.length === 3 && deriveBoardValues(synced[2]).priority === 'P0', 'priority change → board Priority updated');
+  await slack.react(t, 'white_check_mark', B);
+  assert(deriveBoardValues(synced[synced.length - 1]).status === 'done', '✅ → board card moves to Done');
+  const before = synced.length;
+  await github.addIssueComment(1, 'just a note');
+  assert(synced.length === before, 'a plain comment does not touch the board');
+
+  banner('K3. "I did it" vs "the bot did it" is visible on the issue');
+  const full = (await mock.getIssueByNumber(1))!;
+  assert(full.labels.includes('bot-created'), 'issue carries the `bot-created` label');
+  assert(full.body.includes('Created by the **DevOps bot** on behalf of **Ananya (Backend)**'), 'issue body footer says the bot created it, and for whom');
+  assert(full.comments!.some(c => c.body.startsWith(AUDIT_MARKER)), 'bot status/assignment changes carry the 🤖 audit-trail comment');
+
+  await runWithAudit({ actorId: B, actorName: 'dev-b', via: 'Slack message to @bot' }, () => github.addIssueComment(1, 'restarted nginx, monitoring'));
+  const note = (await mock.getIssueByNumber(1))!.comments!.find(c => c.body.includes('restarted nginx'))!;
+  assert(note.body.startsWith(BOT_NOTE_MARKER) && note.body.includes('on behalf of dev-b'), 'a note the bot writes for someone is labelled "posted by the DevOps bot on behalf of dev-b"');
+  const prefixed = (await mock.getIssueByNumber(1))!.comments!.filter(c => c.body.includes(BOT_NOTE_MARKER)).length;
+  await github.addIssueComment(1, `${AUDIT_MARKER}\n- already marked`);
+  assert((await mock.getIssueByNumber(1))!.comments!.filter(c => c.body.includes(BOT_NOTE_MARKER)).length === prefixed, 'audit comments are not double-labelled');
+
+  banner('K4. Issue body always has the requester and the original message');
+  const ev = { userName: 'Ananya', text: 'prod deploy failed\nsee https://ci.example/123' };
+  let body = composeIssueBody('## Request\nFix the deploy\n\n## Definition of done\n- [ ] green build', ev);
+  assert(body.includes('**Requested by:** Ananya') && body.includes('> prod deploy failed') && body.includes('> see https://ci.example/123'), 'requester + quoted original message (all lines) appended');
+  assert(body.includes('<details>') && body.includes('## Definition of done'), 'original message is collapsed; LLM sections are kept');
+  body = composeIssueBody('Fix it.\n\nRequested by: Ananya', ev);
+  assert((body.match(/requested by/gi) || []).length === 1, 'does not duplicate "Requested by" if the LLM already wrote it');
+  body = composeIssueBody('', ev);
+  assert(body.includes('## Request') && body.includes('prod deploy failed'), 'empty LLM body → falls back to the original message');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 
 async function main() {
   testAvailabilityParsing();
@@ -511,6 +634,8 @@ async function main() {
   await testRepeatRequests();
   await testTimerPersistence();
   await testWeeklyReport();
+  await testPriorityChange();
+  await testBoardAndMarkers();
   console.log(`\n🎉 ALL ${passed} FEATURE CHECKS PASSED!\n`);
   process.exit(0);
 }

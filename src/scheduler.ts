@@ -167,9 +167,9 @@ export function startDailyDigest(postToChannel: (text: string) => Promise<void>)
     } catch (err) {
       console.error('❌ Daily digest failed:', err);
     }
-  });
+  }, { timezone: config.bot.timezone });
 
-  console.log(`✓ Daily digest scheduled: "${expr}"`);
+  console.log(`✓ Daily digest scheduled: "${expr}" (${config.bot.timezone})`);
 }
 
 /**

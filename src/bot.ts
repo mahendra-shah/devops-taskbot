@@ -226,6 +226,11 @@ export class DevOpsBot {
         await notifyRequesterOfClosure(n, this.github, postVia(adapter), { id: event.userId, name: event.userName });
       }
 
+      // 8b. Priority changes: raising to P0 starts escalation, lowering stops it
+      for (const pc of result.priorityChanges ?? []) {
+        await this.applyPriorityChange(pc.issueNumber, pc.priority, event, adapter, threadTs);
+      }
+
       // 9. Start the no-reply timer for tagged devs (or newly assigned dev) on root messages.
       //    Devs who are out of office can't reply, so they are not timed.
       if (!isInsideThread) {
@@ -248,6 +253,29 @@ export class DevOpsBot {
     } finally {
       await adapter.removeReaction(event.channelId, event.ts, 'eyes').catch(() => {});
     }
+  }
+
+  private async applyPriorityChange(
+    issueNumber: number,
+    priority: 'P0' | 'P1' | 'P2',
+    event: IncomingMessageEvent,
+    adapter: BotPlatformAdapter,
+    threadTs: string
+  ): Promise<void> {
+    if (priority !== 'P0') {
+      if (store.removeP0Watch(issueNumber)) logAudit('p0.watch_cleared', { issueNumber, detail: `priority changed to ${priority}` });
+      return;
+    }
+    const issue = await this.github.getIssueByNumber(issueNumber);
+    const assignee = issue ? config.team.find(m => issue.assignees.includes(m.githubUsername)) : undefined;
+    if (!issue || !assignee) return;
+
+    // Escalate in the issue's original Slack thread when we know it, else in the current thread.
+    const link = store.getIssueLink(issueNumber);
+    const channelId = link?.channelId ?? event.channelId;
+    const watchThread = link?.threadTs ?? threadTs;
+    await adapter.replyInThread(event.channelId, threadTs, formatP0Alert(issue.number, issue.url, issue.title, assignee.slackId));
+    watchP0({ issueNumber, channelId, threadTs: watchThread, assigneeSlackId: assignee.slackId });
   }
 
   /**

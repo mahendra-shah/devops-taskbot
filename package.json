@@ -15,7 +15,8 @@
     "chat": "npm run build:tests && node dist-tests/tests/cli.js",
     "chat:live": "npm run build:tests && node dist-tests/tests/cli.js --live",
     "clean": "rm -rf dist dist-tests",
-    "test:features": "npm run build:tests && node dist-tests/tests/test-features.js"
+    "test:features": "npm run build:tests && node dist-tests/tests/test-features.js",
+    "check:board": "npm run build:tests && node dist-tests/tests/check-board.js"
   },
   "dependencies": {
     "@octokit/rest": "^20.1.1",

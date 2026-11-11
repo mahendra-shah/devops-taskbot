@@ -27,6 +27,9 @@ function cleanDeepSeekUrl(url?: string): string {
   return trimmed;
 }
 
+/** All schedules (daily digest, weekly report) run in this timezone, regardless of the server's clock (EC2 = UTC). */
+const BOT_TIMEZONE = process.env.BOT_TIMEZONE || process.env.REPORT_TIMEZONE || 'Asia/Kolkata';
+
 export const config = {
   slack: {
     botToken: process.env.SLACK_BOT_TOKEN || '',
@@ -38,6 +41,14 @@ export const config = {
     token: process.env.GITHUB_TOKEN || '',
     owner: process.env.GITHUB_OWNER || '',
     repo: process.env.GITHUB_REPO || '',
+    /** GitHub Projects v2 board to keep in sync (Status + Priority fields). 0 = disabled. */
+    project: {
+      number: parseInt(process.env.GITHUB_PROJECT_NUMBER || '0', 10) || 0,
+      /** 'organization' | 'user' — leave empty to auto-detect. */
+      ownerType: ({ org: 'organization', organization: 'organization', user: 'user' } as Record<string, string>)[
+        (process.env.GITHUB_PROJECT_OWNER_TYPE || '').toLowerCase()
+      ] || '',
+    },
   },
 
   llm: {
@@ -61,6 +72,7 @@ export const config = {
     slaBreachHours: parseInt(process.env.SLA_BREACH_HOURS || '24', 10),
     dailyDigestCron: process.env.DAILY_DIGEST_CRON || '30 9 * * 1-5',
     showDevMetadata: process.env.SHOW_DEV_METADATA === 'true',
+    timezone: BOT_TIMEZONE,
     /** Minutes after a P0 is created at which un-acknowledged P0s escalate (level 1, 2, 3…). */
     escalationMinutes: parseIntList(process.env.ESCALATION_MINUTES, [30, 60, 120]),
     /** Same topic requested this many times within the window → flag it as an automation candidate. */
@@ -70,7 +82,7 @@ export const config = {
 
   report: {
     cron: process.env.WEEKLY_REPORT_CRON || '0 18 * * 5', // Friday 18:00
-    timezone: process.env.REPORT_TIMEZONE || 'Asia/Kolkata',
+    timezone: BOT_TIMEZONE,
     from: process.env.REPORT_FROM || process.env.SMTP_USER || '',
     to: (process.env.REPORT_TO || '').split(',').map(s => s.trim()).filter(Boolean),
     smtp: {

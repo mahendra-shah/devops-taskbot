@@ -7,7 +7,7 @@ import type {
   IssueStatus,
   ThreadMessage,
 } from './types.js';
-import { fetchTeamWorkload, type TeamWorkload } from './utils/workload.js';
+import { fetchTeamWorkload, isTeamMember, type TeamWorkload } from './utils/workload.js';
 import { AUDIT_MARKER, setAssignmentNote } from './audit.js';
 import type { Availability } from './availability.js';
 
@@ -23,6 +23,8 @@ export interface AgentResult {
   assignedGithubUsername?: string;
   /** Issue numbers the agent closed (status → done) during this run. */
   closedIssueNumbers?: number[];
+  /** Priority changes the agent made on existing issues (drives P0 escalation start/stop). */
+  priorityChanges?: { issueNumber: number; priority: 'P0' | 'P1' | 'P2' }[];
 }
 
 function isValidApiKey(key: string): boolean {
@@ -154,7 +156,10 @@ const AGENT_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
           },
           body: {
             type: 'string',
-            description: 'Markdown description covering context, impact, and steps/details.',
+            description:
+              'Structured Markdown with exactly these sections: "## Request" (what is being asked, 1-3 sentences), ' +
+              '"## Context" (environment, services, errors, links or details from the message/thread), ' +
+              '"## Definition of done" (a checklist of 1-3 "- [ ]" items). Do NOT include who requested it or the original message — the system appends those.',
           },
           priority: {
             type: 'string',
@@ -232,6 +237,22 @@ const AGENT_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
           },
         },
         required: ['issue_number', 'assignee_github_username'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'update_issue_priority_or_effort',
+      description: 'Change the priority (P0/P1/P2) and/or effort estimate (low/medium/high) of an EXISTING GitHub issue. Only DevOps team members may do this. Raising an issue to P0 automatically starts P0 escalation.',
+      parameters: {
+        type: 'object',
+        properties: {
+          issue_number: { type: 'number', description: 'The GitHub issue number.' },
+          priority: { type: 'string', enum: ['P0', 'P1', 'P2'], description: 'New priority. P0=prod down/critical, P1=blocking, P2=routine. Omit to leave unchanged.' },
+          estimate: { type: 'string', enum: ['low', 'medium', 'high'], description: 'New effort: low=<1h, medium=1-4h, high=>4h. Omit to leave unchanged.' },
+        },
+        required: ['issue_number'],
       },
     },
   },
@@ -325,6 +346,7 @@ BEHAVIOR RULES:
    - If asked about team workload / who is doing what, answer directly from TEAM MEMBERS & CURRENT WORKLOAD above.
    - If asked to update status (e.g. "update this task status from in progress to done", "mark #4 blocked", "reopen this", "start working on this"), call \`update_issue_status\`.
    - If asked to reassign, call \`reassign_issue\`.
+   - If asked to change an existing issue's priority/urgency or effort/estimate (e.g. "make this P0", "this is low priority", "bump to high effort"), call \`update_issue_priority_or_effort\`. Only DevOps team members may do this; if the tool refuses, explain that politely. Raising to P0 automatically starts escalation, so don't promise anything beyond that.
    - If asked to log/note findings on an issue, call \`add_issue_comment\`.
 
 3. **FYIs or non-tasks**:
@@ -359,6 +381,7 @@ BEHAVIOR RULES:
   let createdTaskPriority: 'P0' | 'P1' | 'P2' | undefined;
   let assignedGithubUsername: string | undefined;
   const closedIssueNumbers: number[] = [];
+  const priorityChanges: { issueNumber: number; priority: 'P0' | 'P1' | 'P2' }[] = [];
 
   const MAX_TURNS = 6;
   for (let turn = 0; turn < MAX_TURNS; turn++) {
@@ -370,9 +393,9 @@ BEHAVIOR RULES:
     if (!toolCalls || toolCalls.length === 0) {
       const text = (choice.content || '').trim();
       if (!text || text === 'NO_REPLY') {
-        return { replyText: null, createdIssue, createdTaskPriority, assignedGithubUsername, closedIssueNumbers };
+        return { replyText: null, createdIssue, createdTaskPriority, assignedGithubUsername, closedIssueNumbers, priorityChanges };
       }
-      return { replyText: text, createdIssue, createdTaskPriority, assignedGithubUsername, closedIssueNumbers };
+      return { replyText: text, createdIssue, createdTaskPriority, assignedGithubUsername, closedIssueNumbers, priorityChanges };
     }
 
     // Append assistant's tool call request
@@ -429,7 +452,7 @@ BEHAVIOR RULES:
             const issue = await github.createIssue(
               {
                 title: String(args.title || event.text.slice(0, 75)),
-                body: String(args.body || event.text),
+                body: composeIssueBody(String(args.body || ''), event),
                 priority,
                 estimate,
               },
@@ -476,6 +499,29 @@ BEHAVIOR RULES:
               : JSON.stringify({ error: `Issue #${num} not found.` });
             break;
           }
+          case 'update_issue_priority_or_effort': {
+            const num = Number(args.issue_number);
+            if (!isTeamMember(event.userId)) {
+              toolOutput = JSON.stringify({
+                error: 'Only DevOps team members can change priority or effort. Tell the user a teammate needs to do it, and offer to add a comment on the issue noting the request instead.',
+              });
+              break;
+            }
+            const priority = ['P0', 'P1', 'P2'].includes(args.priority) ? (args.priority as 'P0' | 'P1' | 'P2') : undefined;
+            const estimate = ['low', 'medium', 'high'].includes(args.estimate) ? (args.estimate as 'low' | 'medium' | 'high') : undefined;
+            if (!priority && !estimate) {
+              toolOutput = JSON.stringify({ error: 'Provide a valid priority (P0/P1/P2) and/or estimate (low/medium/high).' });
+              break;
+            }
+            const updated = await github.updateIssueMeta(num, { priority, estimate });
+            if (!updated) {
+              toolOutput = JSON.stringify({ error: `Issue #${num} not found.` });
+            } else {
+              if (priority) priorityChanges.push({ issueNumber: num, priority });
+              toolOutput = JSON.stringify({ updated: true, number: updated.number, labels: updated.labels, url: updated.url });
+            }
+            break;
+          }
           case 'add_issue_comment': {
             const num = Number(args.issue_number);
             await github.addIssueComment(num, String(args.comment || ''));
@@ -505,6 +551,7 @@ BEHAVIOR RULES:
     createdTaskPriority,
     assignedGithubUsername,
     closedIssueNumbers,
+    priorityChanges,
   };
 }
 
@@ -515,6 +562,17 @@ function validateAssignee(candidate: string): string {
   const bySlack = config.team.find(m => m.slackId === cleaned);
   if (bySlack) return bySlack.githubUsername;
   return config.team[0]?.githubUsername || cleaned;
+}
+
+/**
+ * Guarantees every issue body has the requester and the original Slack message, whatever the LLM wrote.
+ */
+export function composeIssueBody(body: string, event: Pick<IncomingMessageEvent, 'userName' | 'text'>): string {
+  let out = body.trim() || `## Request\n${event.text.trim()}`;
+  if (!/requested by/i.test(out)) out += `\n\n**Requested by:** ${event.userName}`;
+  const quoted = event.text.trim().split('\n').map(l => `> ${l}`).join('\n');
+  out += `\n\n<details><summary>Original Slack message</summary>\n\n${quoted}\n\n</details>`;
+  return out;
 }
 
 export interface AssigneeChoice {
@@ -678,7 +736,7 @@ export async function generateDailyDigest(
     return `  • *${w.githubUsername}* — ${w.openIssues.length} open, ${inP} in-progress${topTasks ? `: ${topTasks}` : ''}`;
   }).join('\n');
 
-  let digest = `📋 *DevOps Daily Standup — ${new Date().toDateString()}*\n`;
+  let digest = `📋 *DevOps Daily Standup — ${new Date().toLocaleDateString('en-GB', { timeZone: config.bot.timezone, weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' })}*\n`;
   digest += `🔴 Open: *${totalOpen}* | 🔄 In Progress: *${totalInProgress}* | ✅ Closed yesterday: *${closedYesterday}*`;
   if (p0Count > 0) digest += ` | 🚨 P0 issues: *${p0Count}*`;
   digest += `\n\n*Team Breakdown:*\n${perPersonLines}`;
