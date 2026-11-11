@@ -1,0 +1,36 @@
+{
+  "name": "devops-tracker",
+  "version": "1.0.0",
+  "description": "Slack \u2194 GitHub Issues DevOps task tracker bot with LLM-powered smart assignment",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "build:tests": "tsc -p tsconfig.tests.json",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch & node --watch dist/index.js",
+    "test": "npm run build:tests && node dist-tests/tests/test-offline.js && node dist-tests/tests/test-features.js",
+    "test:llm": "npm run build:tests && node dist-tests/tests/test-llm.js",
+    "test:scenarios": "npm run build:tests && node dist-tests/tests/test-scenarios.js",
+    "chat": "npm run build:tests && node dist-tests/tests/cli.js",
+    "chat:live": "npm run build:tests && node dist-tests/tests/cli.js --live",
+    "clean": "rm -rf dist dist-tests",
+    "test:features": "npm run build:tests && node dist-tests/tests/test-features.js"
+  },
+  "dependencies": {
+    "@octokit/rest": "^20.1.1",
+    "@slack/bolt": "^3.21.2",
+    "better-sqlite3": "^13.0.3",
+    "dotenv": "^16.4.5",
+    "node-cron": "^3.0.3",
+    "nodemailer": "^10.5.0",
+    "openai": "^4.33.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^20.11.24",
+    "@types/node-cron": "^3.0.11",
+    "@types/nodemailer": "^8.0.2",
+    "typescript": "^5.3.3"
+  }
+}
