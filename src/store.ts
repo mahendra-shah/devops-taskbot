@@ -76,6 +76,19 @@ export function getDb(): Database.Database {
       flagged_at  INTEGER NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS sla_state (
+      issue_number     INTEGER PRIMARY KEY,
+      last_status      TEXT,
+      last_activity_ms INTEGER,
+      last_tick_ms     INTEGER,
+      paused_hours     REAL NOT NULL DEFAULT 0,
+      last_alert_ms    INTEGER,
+      alert_count      INTEGER NOT NULL DEFAULT 0,
+      snoozed_until_ms INTEGER,
+      eta_ms           INTEGER,
+      eta_alerted      INTEGER NOT NULL DEFAULT 0
+    );
+
     CREATE TABLE IF NOT EXISTS ooo_seen (
       user_id       TEXT NOT NULL,
       signature     TEXT NOT NULL,
@@ -164,6 +177,11 @@ export function getIssueLink(issueNumber: number): IssueLinkRow | null {
 
 export function listIssueLinks(): IssueLinkRow[] {
   return (getDb().prepare('SELECT * FROM issue_links').all() as any[]).map(mapLink);
+}
+
+export function getIssueLinkByThread(threadTs: string): IssueLinkRow | null {
+  const r = getDb().prepare('SELECT * FROM issue_links WHERE thread_ts = ? ORDER BY issue_number LIMIT 1').get(threadTs);
+  return r ? mapLink(r) : null;
 }
 
 export function setClosedNotified(issueNumber: number, notified: boolean): void {
@@ -325,4 +343,60 @@ export function pruneOooSeen(userId: string, keepSignatures: string[]): void {
   getDb()
     .prepare(`DELETE FROM ooo_seen WHERE user_id = ? AND signature NOT IN (${placeholders})`)
     .run(userId, ...keepSignatures);
+}
+
+// ── SLA state (per open issue) ─────────────────────────────────────────────
+
+export interface SlaStateRow {
+  issueNumber: number;
+  lastStatus: string | null;
+  lastActivityMs: number | null;
+  lastTickMs: number | null;
+  /** Working hours during which the assignee was out of office (the SLA clock is paused). */
+  pausedHours: number;
+  lastAlertMs: number | null;
+  alertCount: number;
+  snoozedUntilMs: number | null;
+  etaMs: number | null;
+  etaAlerted: boolean;
+}
+
+export function getSlaState(issueNumber: number): SlaStateRow | null {
+  const r = getDb().prepare('SELECT * FROM sla_state WHERE issue_number = ?').get(issueNumber) as any;
+  if (!r) return null;
+  return {
+    issueNumber: r.issue_number,
+    lastStatus: r.last_status,
+    lastActivityMs: r.last_activity_ms,
+    lastTickMs: r.last_tick_ms,
+    pausedHours: r.paused_hours,
+    lastAlertMs: r.last_alert_ms,
+    alertCount: r.alert_count,
+    snoozedUntilMs: r.snoozed_until_ms,
+    etaMs: r.eta_ms,
+    etaAlerted: Boolean(r.eta_alerted),
+  };
+}
+
+export function saveSlaState(s: SlaStateRow): void {
+  getDb()
+    .prepare(
+      `INSERT INTO sla_state (issue_number, last_status, last_activity_ms, last_tick_ms, paused_hours, last_alert_ms,
+                              alert_count, snoozed_until_ms, eta_ms, eta_alerted)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(issue_number) DO UPDATE SET last_status=excluded.last_status, last_activity_ms=excluded.last_activity_ms,
+         last_tick_ms=excluded.last_tick_ms, paused_hours=excluded.paused_hours, last_alert_ms=excluded.last_alert_ms,
+         alert_count=excluded.alert_count, snoozed_until_ms=excluded.snoozed_until_ms, eta_ms=excluded.eta_ms,
+         eta_alerted=excluded.eta_alerted`
+    )
+    .run(s.issueNumber, s.lastStatus, s.lastActivityMs, s.lastTickMs, s.pausedHours, s.lastAlertMs, s.alertCount, s.snoozedUntilMs, s.etaMs, s.etaAlerted ? 1 : 0);
+}
+
+/** Forget the SLA state of an issue once it is no longer open. */
+export function deleteSlaState(issueNumber: number): void {
+  getDb().prepare('DELETE FROM sla_state WHERE issue_number = ?').run(issueNumber);
+}
+
+export function listSlaIssueNumbers(): number[] {
+  return (getDb().prepare('SELECT issue_number FROM sla_state').all() as any[]).map(r => r.issue_number);
 }

@@ -1,3 +1,5 @@
+import type { ThreadMessage } from '../types.js';
+
 /**
  * Formats a Slack-safe mrkdwn message for issue creation confirmation.
  */
@@ -113,4 +115,32 @@ export function stripMentions(text: string): string {
 export function extractMentionedUserIds(text: string): string[] {
   const matches = text.match(/<@([A-Z0-9]+)>/g) || [];
   return matches.map(m => m.replace(/<@|>/g, ''));
+}
+
+/**
+ * Who actually asked for the work?
+ * Inside a thread, the person who wrote the thread's FIRST message is the requester — not whoever
+ * later tagged the bot (often a teammate saying "@bot add this to github"). Otherwise it's the sender.
+ */
+export function resolveRequester(
+  event: { userId: string; userName: string; text: string },
+  threadHistory: ThreadMessage[],
+  threadTs: string
+): { id: string; name: string; text: string; fromThreadRoot: boolean } {
+  const root = threadHistory.find(m => m.ts === threadTs && m.role === 'user' && m.senderId);
+  if (root && root.senderId) {
+    return { id: root.senderId, name: root.senderName, text: root.content, fromThreadRoot: true };
+  }
+  return { id: event.userId, name: event.userName, text: event.text, fromThreadRoot: false };
+}
+
+/** Slack markup → readable text for GitHub: <@U1> → @name, <url|label> → label (url). */
+export function slackToPlain(text: string, nameOf?: (slackId: string) => string | undefined): string {
+  return text
+    .replace(/<@([A-Z0-9]+)>/g, (_m, id: string) => `@${nameOf?.(id) ?? 'someone'}`)
+    .replace(/<(https?:[^|>]+)\|([^>]+)>/g, '$2 ($1)')
+    .replace(/<(https?:[^>]+)>/g, '$1')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
 }

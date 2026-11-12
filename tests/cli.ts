@@ -68,7 +68,7 @@ Tips:
     return `[${currentUserName} @ ${loc}]> `;
   }
 
-  console.log('\n💬 DevOps Tracker Interactive Simulator (No Slack Needed)');
+  console.log('\n💬 DevOps Taskbot Interactive Simulator (No Slack Needed)');
   console.log(`   Team: ${config.team.map(m => m.githubUsername).join(', ')}`);
   printHelp();
 

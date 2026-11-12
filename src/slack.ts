@@ -4,17 +4,18 @@ import { config } from './config.js';
 import { liveGitHubProvider } from './github.js';
 import { DevOpsBot } from './bot.js';
 import type { BotPlatformAdapter, PostMessageFn, ThreadMessage } from './types.js';
-import { isTeamMember } from './utils/workload.js';
+import { isTeamMember, setDefaultGitHubProvider } from './utils/workload.js';
 import {
   trackPendingReply,
   clearPendingReply,
   snoozeReplyTimer,
   restorePendingReplies,
   startDailyDigest,
-  startSLAChecker,
 } from './scheduler.js';
+import { startSlaChecker } from './sla.js';
 import { AuditedGitHubProvider } from './audit.js';
 import { liveProjectBoard } from './projectBoard.js';
+import { checkLlmProviders } from './llm.js';
 import { availabilityService, describeAvailability, profileFromSlackUser } from './availability.js';
 import { ackThread, startEscalationChecker } from './escalation.js';
 import { startClosurePoller } from './requesterUpdates.js';
@@ -250,7 +251,7 @@ export async function startSlackBot(): Promise<void> {
   });
 
   await app.start();
-  console.log('⚡️ DevOps Tracker Bot is running in Socket Mode!');
+  console.log('⚡️ DevOps Taskbot is running in Socket Mode!');
 
   const postToChannel = async (text: string) => {
     await app.client.chat.postMessage({
@@ -264,12 +265,19 @@ export async function startSlackBot(): Promise<void> {
     await app.client.chat.postMessage({ token: config.slack.botToken, channel: channelId, thread_ts: threadTs, text });
   };
 
-  startDailyDigest(postToChannel);
-  startSLAChecker(postToChannel);
+  // Digest, timers and `@bot status` must see the board's Status/Priority, so they use the same board-aware provider.
+  setDefaultGitHubProvider(github);
+  startDailyDigest(postToChannel, github);
+  startSlaChecker(github, post);
   startEscalationChecker(github, post);
   startClosurePoller(github, post);
   startWeeklyReport(github, id => resolveUserName(app.client, id));
   restorePendingReplies(payload => app.client.chat.postMessage({ token: config.slack.botToken, ...payload }));
+
+  // Startup self-check: a rejected API key should show up here, not in a Slack thread.
+  checkLlmProviders()
+    .then(lines => lines.forEach(l => console.log(l)))
+    .catch(err => console.warn('⚠️ AI provider check failed to run:', (err as Error).message));
 
   // Startup visibility: who does the bot currently consider out of office?
   for (const member of config.team) {

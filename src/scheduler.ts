@@ -1,6 +1,7 @@
 import cron from 'node-cron';
 import { config } from './config.js';
-import { addIssueLabel } from './github.js';
+import { slaAttentionLines } from './sla.js';
+import type { GitHubProvider } from './types.js';
 import { fetchTeamWorkload, countClosedYesterday, getWorkloadForSlackUser } from './utils/workload.js';
 import { generateDailyDigest, generateWorkloadReply } from './llm.js';
 import { splitMessage } from './utils/helpers.js';
@@ -146,7 +147,7 @@ export function restorePendingReplies(say: (payload: any) => Promise<any>): numb
  * Starts the daily digest cron job.
  * Posts a standup summary to the devops channel every weekday morning.
  */
-export function startDailyDigest(postToChannel: (text: string) => Promise<void>): void {
+export function startDailyDigest(postToChannel: (text: string) => Promise<void>, github: GitHubProvider): void {
   const expr = config.bot.dailyDigestCron;
   if (!cron.validate(expr)) {
     console.warn(`⚠️ Invalid DAILY_DIGEST_CRON expression "${expr}" — daily digest disabled.`);
@@ -162,7 +163,8 @@ export function startDailyDigest(postToChannel: (text: string) => Promise<void>)
       const outLines = config.team
         .filter(m => !away.get(m.slackId)?.available)
         .map(m => `<@${m.slackId}> (*${m.githubUsername}*) — out until ${away.get(m.slackId)?.untilLabel ?? 'later'}`);
-      const digest = await generateDailyDigest(workloads, closedYesterday, outLines);
+      const attention = await slaAttentionLines(github);
+      const digest = await generateDailyDigest(workloads, closedYesterday, outLines, attention);
       await postToChannel(digest);
     } catch (err) {
       console.error('❌ Daily digest failed:', err);
@@ -170,40 +172,4 @@ export function startDailyDigest(postToChannel: (text: string) => Promise<void>)
   }, { timezone: config.bot.timezone });
 
   console.log(`✓ Daily digest scheduled: "${expr}" (${config.bot.timezone})`);
-}
-
-/**
- * Starts the SLA breach checker.
- * Runs every hour and pings the assignee on Slack if an issue is overdue.
- */
-export function startSLAChecker(
-  postToChannel: (text: string) => Promise<void>
-): void {
-  cron.schedule('0 * * * *', async () => {
-    console.log('🔍 Checking SLA breaches...');
-    try {
-      const workloads = await fetchTeamWorkload();
-      const thresholdMs = config.bot.slaBreachHours * 60 * 60 * 1000;
-      const now = Date.now();
-
-      for (const w of workloads) {
-        for (const issue of w.openIssues) {
-          const ageMs = now - new Date(issue.createdAt).getTime();
-          if (ageMs > thresholdMs && !issue.labels.includes('sla-breach-alerted')) {
-            console.log(`⚠️ SLA breach: Issue #${issue.number} assigned to ${w.githubUsername} is overdue.`);
-            await postToChannel(
-              `⚠️ *SLA Breach Alert!*\n` +
-              `Issue <${issue.url}|#${issue.number} ${issue.title}> assigned to <@${w.slackId}> (*${w.githubUsername}*) has been open for more than ${config.bot.slaBreachHours} hours.\n` +
-              `Please update or escalate.`
-            );
-            await addIssueLabel(issue.number, 'sla-breach-alerted').catch(() => {});
-          }
-        }
-      }
-    } catch (err) {
-      console.error('❌ SLA check failed:', err);
-    }
-  });
-
-  console.log(`✓ SLA checker running (breach threshold: ${config.bot.slaBreachHours}h)`);
 }

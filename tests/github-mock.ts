@@ -1,5 +1,5 @@
 import { config } from '../src/config.js';
-import type { GitHubIssue, GitHubProvider, IssueStatus, ParsedTask } from '../src/types.js';
+import type { GitHubIssue, GitHubProvider, IssueStatus, ParsedTask, Priority } from '../src/types.js';
 
 /**
  * In-memory GitHub Issues simulator used for testing and sandbox chat
@@ -11,7 +11,11 @@ export class MockGitHubProvider implements GitHubProvider {
   private tsToIssueNumber = new Map<string, number>();
   private nextNumber = 1;
 
-  constructor(seedSampleIssues = true) {
+  /** Mimics the live provider in board mode: no status/priority labels are written. */
+  private readonly boardMode: boolean;
+
+  constructor(seedSampleIssues = true, opts: { boardMode?: boolean } = {}) {
+    this.boardMode = Boolean(opts.boardMode);
     if (seedSampleIssues && config.team.length > 0) {
       const m0 = config.team[0]?.githubUsername || 'dev-1';
       const m1 = config.team[1]?.githubUsername || m0;
@@ -77,7 +81,7 @@ export class MockGitHubProvider implements GitHubProvider {
       body: `${task.body}\n\n---\n📎 **Slack thread:** channel=${slackChannelId} ts=${slackMessageTs}`,
       url: `https://github.com/${config.github.owner || 'org'}/${config.github.repo || 'devops-tasks'}/issues/${num}`,
       state: 'open',
-      labels: ['devops', 'bot-created', task.priority, `effort:${task.estimate}`],
+      labels: ['devops', 'bot-created', ...(this.boardMode ? [] : [task.priority]), `effort:${task.estimate}`],
       assignees: [assigneeGithubUsername],
       createdAt: now,
       updatedAt: now,
@@ -101,7 +105,7 @@ export class MockGitHubProvider implements GitHubProvider {
     } else {
       issue.state = 'open';
       issue.closedAt = undefined;
-      if (status !== 'open') {
+      if (status !== 'open' && !this.boardMode) {
         issue.labels.push(status);
       }
     }
@@ -121,11 +125,14 @@ export class MockGitHubProvider implements GitHubProvider {
 
   async updateIssueMeta(
     issueNumber: number,
-    meta: { priority?: 'P0' | 'P1' | 'P2'; estimate?: 'low' | 'medium' | 'high' }
+    meta: { priority?: Priority; estimate?: 'low' | 'medium' | 'high' }
   ): Promise<GitHubIssue | null> {
     const issue = this.issues.find(i => i.number === issueNumber);
     if (!issue) return null;
-    if (meta.priority) issue.labels = issue.labels.filter(l => !['P0', 'P1', 'P2'].includes(l)).concat(meta.priority);
+    if (meta.priority) {
+      issue.labels = issue.labels.filter(l => !['P0', 'P1', 'P2', 'P3'].includes(l));
+      if (!this.boardMode) issue.labels.push(meta.priority);
+    }
     if (meta.estimate) issue.labels = issue.labels.filter(l => !l.startsWith('effort:')).concat(`effort:${meta.estimate}`);
     issue.updatedAt = new Date().toISOString();
     return { ...issue };
@@ -136,7 +143,7 @@ export class MockGitHubProvider implements GitHubProvider {
     if (!issue) return;
     issue.comments = issue.comments || [];
     issue.comments.push({
-      author: 'devops-tracker-bot',
+      author: 'devops-taskbot',
       body: comment,
       createdAt: new Date().toISOString(),
     });
@@ -203,12 +210,22 @@ export class MockGitHubProvider implements GitHubProvider {
       .map(i => ({ ...i }));
   }
 
+  /** Test helper: pretend an issue was created / last updated at a given time (for SLA tests). */
+  public backdate(issueNumber: number, createdMs: number, updatedMs: number = createdMs): void {
+    const issue = this.issues.find(i => i.number === issueNumber);
+    if (issue) {
+      issue.createdAt = new Date(createdMs).toISOString();
+      issue.updatedAt = new Date(updatedMs).toISOString();
+    }
+  }
+
   /** Test helper: close an issue "directly on GitHub" (bypassing the bot). */
-  public closeDirectly(issueNumber: number): void {
+  public closeDirectly(issueNumber: number, closedByLogin?: string): void {
     const issue = this.issues.find(i => i.number === issueNumber);
     if (issue) {
       issue.state = 'closed';
       issue.closedAt = new Date().toISOString();
+      issue.closedBy = closedByLogin;
     }
   }
 

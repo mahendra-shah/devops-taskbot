@@ -1,11 +1,17 @@
 import { Octokit } from '@octokit/rest';
 import { config } from './config.js';
-import type { GitHubIssue, GitHubProvider, IssueStatus, ParsedTask } from './types.js';
+import type { GitHubIssue, GitHubProvider, IssueStatus, ParsedTask, Priority } from './types.js';
 
 export type { GitHubIssue, ParsedTask } from './types.js';
 
 const octokit = new Octokit({ auth: config.github.token });
 const { owner, repo } = config.github;
+
+/**
+ * Board mode: the GitHub Projects board holds Status + Priority, so we don't write `in-progress` / `P1`
+ * labels. (If a value can't be written to the board, the audit layer falls back to a label.)
+ */
+const boardMode = () => config.github.project.number > 0;
 
 function mapOctokitIssue(issue: any): GitHubIssue {
   return {
@@ -19,11 +25,12 @@ function mapOctokitIssue(issue: any): GitHubIssue {
     createdAt: issue.created_at,
     updatedAt: issue.updated_at,
     closedAt: issue.closed_at || undefined,
+    closedBy: issue.closed_by?.login || undefined,
   };
 }
 
 function buildLabels(task: Pick<ParsedTask, 'priority' | 'estimate'>): string[] {
-  return ['devops', 'bot-created', task.priority, `effort:${task.estimate}`];
+  return ['devops', 'bot-created', ...(boardMode() ? [] : [task.priority]), `effort:${task.estimate}`];
 }
 
 export async function createIssue(
@@ -70,7 +77,7 @@ export async function updateIssueStatus(
     return mapOctokitIssue(updated);
   }
 
-  if (status !== 'open') {
+  if (status !== 'open' && !boardMode()) {
     cleanedLabels.push(status);
   }
 
@@ -87,11 +94,14 @@ export async function updateIssueStatus(
 
 export async function updateIssueMeta(
   issueNumber: number,
-  meta: { priority?: 'P0' | 'P1' | 'P2'; estimate?: 'low' | 'medium' | 'high' }
+  meta: { priority?: Priority; estimate?: 'low' | 'medium' | 'high' }
 ): Promise<GitHubIssue | null> {
   const { data: issue } = await octokit.rest.issues.get({ owner, repo, issue_number: issueNumber });
   let labels = (issue.labels as any[]).map(l => (typeof l === 'string' ? l : l.name || ''));
-  if (meta.priority) labels = labels.filter(l => !['P0', 'P1', 'P2'].includes(l)).concat(meta.priority);
+  if (meta.priority) {
+    labels = labels.filter(l => !['P0', 'P1', 'P2', 'P3'].includes(l));
+    if (!boardMode()) labels.push(meta.priority);
+  }
   if (meta.estimate) labels = labels.filter(l => !l.startsWith('effort:')).concat(`effort:${meta.estimate}`);
   const { data } = await octokit.rest.issues.update({ owner, repo, issue_number: issueNumber, labels });
   console.log(`✓ Issue #${issueNumber} meta updated → ${[meta.priority, meta.estimate && `effort:${meta.estimate}`].filter(Boolean).join(', ')}`);
@@ -158,12 +168,12 @@ export async function ensureLabelsExist(): Promise<void> {
     { name: 'P0', color: 'e11d48', description: 'Critical / production issue' },
     { name: 'P1', color: 'f97316', description: 'High priority' },
     { name: 'P2', color: '84cc16', description: 'Normal priority' },
+    { name: 'P3', color: '9ca3af', description: 'Low priority' },
     { name: 'effort:low', color: 'bbf7d0', description: 'Estimated < 1 hour' },
     { name: 'effort:medium', color: 'fef08a', description: 'Estimated 1-4 hours' },
     { name: 'effort:high', color: 'fecaca', description: 'Estimated > 4 hours' },
     { name: 'devops', color: '6366f1', description: 'DevOps task' },
-    { name: 'bot-created', color: '0e8a16', description: 'Issue was created by the DevOps bot from a Slack request' },
-    { name: 'sla-breach-alerted', color: 'b60205', description: 'SLA breach notification already sent' },
+    { name: 'bot-created', color: '0e8a16', description: 'Issue was created by the DevOps Taskbot from a Slack request' },
   ];
 
   const { data: existingLabels } = await octokit.rest.issues.listLabelsForRepo({ owner, repo, per_page: 100 });

@@ -3,6 +3,15 @@ import { liveGitHubProvider, countClosedYesterday } from '../github.js';
 import type { GitHubIssue, GitHubProvider } from '../types.js';
 import { availabilityService } from '../availability.js';
 
+/**
+ * The provider used when a caller doesn't pass one. slack.ts sets this to the audited, board-aware provider so the
+ * digest, timers etc. see the board's Status/Priority (not just labels).
+ */
+let defaultProvider: GitHubProvider = liveGitHubProvider;
+export function setDefaultGitHubProvider(provider: GitHubProvider): void {
+  defaultProvider = provider;
+}
+
 export interface TeamWorkload {
   slackId: string;
   githubUsername: string;
@@ -30,7 +39,7 @@ export function computeLoadScore(issues: GitHubIssue[]): number {
 /**
  * Fetches the current workload for every team member.
  */
-export async function fetchTeamWorkload(github: GitHubProvider = liveGitHubProvider): Promise<TeamWorkload[]> {
+export async function fetchTeamWorkload(github: GitHubProvider = defaultProvider): Promise<TeamWorkload[]> {
   return Promise.all(
     config.team.map(async member => {
       const openIssues = await github.getOpenIssuesForUser(member.githubUsername);
@@ -47,7 +56,7 @@ export async function fetchTeamWorkload(github: GitHubProvider = liveGitHubProvi
 /**
  * Returns a formatted Slack mrkdwn string showing the current team workload.
  */
-export async function buildStatusMessage(github: GitHubProvider = liveGitHubProvider): Promise<string> {
+export async function buildStatusMessage(github: GitHubProvider = defaultProvider): Promise<string> {
   const workloads = await fetchTeamWorkload(github);
   const availability = await availabilityService.getMany(workloads.map(w => w.slackId));
   const totalOpen = workloads.reduce((s, w) => s + w.openIssues.length, 0);
@@ -80,7 +89,7 @@ export async function buildStatusMessage(github: GitHubProvider = liveGitHubProv
 
 export async function getWorkloadForSlackUser(
   slackId: string,
-  github: GitHubProvider = liveGitHubProvider
+  github: GitHubProvider = defaultProvider
 ): Promise<GitHubIssue[]> {
   const member = config.team.find(m => m.slackId === slackId);
   if (!member) return [];
@@ -92,7 +101,24 @@ export function githubUsernameForSlackId(slackId: string): string | null {
 }
 
 export function slackIdForGithubUsername(githubUsername: string): string | null {
-  return config.team.find(m => m.githubUsername === githubUsername)?.slackId ?? null;
+  return config.team.find(m => m.githubUsername.toLowerCase() === githubUsername.toLowerCase())?.slackId ?? null;
+}
+
+/**
+ * Finds a configured team member by GitHub username, Slack ID, or an unambiguous first-name style prefix
+ * ("komal" → "komal-gh"). Returns null when the person isn't in TEAM_MEMBERS — callers must NOT guess.
+ */
+export function findTeamMember(query: string): { slackId: string; githubUsername: string } | null {
+  const q = query.trim().replace(/^<@|>$/g, '').replace(/^@/, '').toLowerCase();
+  if (!q) return null;
+  const exact = config.team.find(m => m.githubUsername.toLowerCase() === q || m.slackId.toLowerCase() === q);
+  if (exact) return exact;
+  if (q.length < 3) return null;
+  const partial = config.team.filter(m => {
+    const u = m.githubUsername.toLowerCase();
+    return u.startsWith(q) || q.startsWith(u.split(/[-_.]/)[0]) && u.split(/[-_.]/)[0].length >= 3;
+  });
+  return partial.length === 1 ? partial[0] : null;
 }
 
 export function isTeamMember(slackId: string): boolean {

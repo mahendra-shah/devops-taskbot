@@ -1,5 +1,5 @@
 {
-  "name": "devops-tracker",
+  "name": "devops-taskbot",
   "version": "1.0.0",
   "description": "Slack \u2194 GitHub Issues DevOps task tracker bot with LLM-powered smart assignment",
   "type": "module",
@@ -16,7 +16,8 @@
     "chat:live": "npm run build:tests && node dist-tests/tests/cli.js --live",
     "clean": "rm -rf dist dist-tests",
     "test:features": "npm run build:tests && node dist-tests/tests/test-features.js",
-    "check:board": "npm run build:tests && node dist-tests/tests/check-board.js"
+    "check:board": "npm run build:tests && node dist-tests/tests/check-board.js",
+    "preview:issue": "npm run build:tests && node dist-tests/tests/preview-issue.js"
   },
   "dependencies": {
     "@octokit/rest": "^20.1.1",

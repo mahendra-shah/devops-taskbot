@@ -3,7 +3,7 @@ import { ensureLabelsExist } from './github.js';
 import { startSlackBot } from './slack.js';
 
 (async () => {
-  console.log('🚀 DevOps Tracker Bot starting...');
+  console.log('🚀 DevOps Taskbot starting...');
   console.log(`   Provider: ${config.llm.provider.toUpperCase()}`);
   console.log(`   GitHub: ${config.github.owner}/${config.github.repo}`);
   console.log(`   Devops Channel: ${config.slack.devopsChannelId}`);
@@ -24,7 +24,7 @@ import { startSlackBot } from './slack.js';
 //  Graceful shutdown
 // ============================================================
 async function shutdown(signal: string) {
-  console.log(`\n${signal} received. Shutting down DevOps Tracker Bot...`);
+  console.log(`\n${signal} received. Shutting down DevOps Taskbot...`);
   process.exit(0);
 }
 

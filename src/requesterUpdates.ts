@@ -1,6 +1,7 @@
 import cron from 'node-cron';
 import * as store from './store.js';
-import { logAudit, AUDIT_MARKER } from './audit.js';
+import { logAudit, isAuditComment } from './audit.js';
+import { slackIdForGithubUsername } from './utils/workload.js';
 import { summarizeResolution } from './llm.js';
 import type { GitHubIssue, GitHubProvider, PostMessageFn } from './types.js';
 
@@ -18,7 +19,7 @@ import type { GitHubIssue, GitHubProvider, PostMessageFn } from './types.js';
 const MAX_STALE_MS = 3 * 24 * 60 * 60 * 1000;
 
 function fallbackSummary(issue: GitHubIssue): string {
-  const humanComments = (issue.comments || []).filter(c => !c.body.startsWith(AUDIT_MARKER));
+  const humanComments = (issue.comments || []).filter(c => !isAuditComment(c.body));
   const last = humanComments[humanComments.length - 1];
   if (last) return last.body.replace(/\s+/g, ' ').slice(0, 220);
   return 'Marked as done.';
@@ -40,7 +41,19 @@ export async function notifyRequesterOfClosure(
   // Claim it first so two concurrent paths (reaction + poll) can't both announce.
   store.setClosedNotified(issueNumber, true);
 
-  if (closedBy?.id && closedBy.id === link.requesterId) return false; // they closed their own request
+  // Who closed it? Slack path tells us directly; for closures made on GitHub we map the GitHub login to a teammate.
+  const closerId = closedBy?.id ?? (issue.closedBy ? slackIdForGithubUsername(issue.closedBy) ?? undefined : undefined);
+
+  // Nothing to announce when the requester closed their own request, or asked for the work for themselves.
+  if (closerId && closerId === link.requesterId) {
+    logAudit('requester.skipped', { issueNumber, detail: 'requester closed their own request' });
+    return false;
+  }
+  const assigneeSlackId = issue.assignees.map(a => slackIdForGithubUsername(a)).find(Boolean);
+  if (assigneeSlackId && assigneeSlackId === link.requesterId) {
+    logAudit('requester.skipped', { issueNumber, detail: 'requester is also the assignee' });
+    return false;
+  }
 
   let summary: string;
   try {
@@ -50,7 +63,7 @@ export async function notifyRequesterOfClosure(
   }
 
   const assignee = issue.assignees[0];
-  const by = closedBy?.id ? ` by <@${closedBy.id}>` : assignee ? ` (handled by *${assignee}*)` : '';
+  const by = closerId ? ` by <@${closerId}>` : issue.closedBy ? ` by *${issue.closedBy}*` : assignee ? ` (handled by *${assignee}*)` : '';
   const text =
     `✅ <@${link.requesterId}> your request is resolved — <${issue.url}|#${issue.number} ${issue.title}> was closed${by}.\n` +
     `_${summary}_`;

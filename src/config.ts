@@ -20,6 +20,24 @@ function parseIntList(raw: string | undefined, fallback: number[]): number[] {
   return nums.length > 0 ? nums.sort((a, b) => a - b) : fallback;
 }
 
+function numEnv(name: string, fallback: number): number {
+  const n = parseFloat(process.env[name] || '');
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/** "1-5" or "1,2,3,4,5" → ISO weekdays (1 = Mon … 7 = Sun). */
+function parseWorkDays(raw: string | undefined, fallback: number[]): number[] {
+  if (!raw || !raw.trim()) return fallback;
+  const range = /^(\d)-(\d)$/.exec(raw.trim());
+  if (range) {
+    const out: number[] = [];
+    for (let d = +range[1]; d <= +range[2]; d++) out.push(d);
+    return out.length ? out : fallback;
+  }
+  const list = raw.split(',').map(x => parseInt(x.trim(), 10)).filter(n => n >= 1 && n <= 7);
+  return list.length ? list : fallback;
+}
+
 function cleanDeepSeekUrl(url?: string): string {
   if (!url) return 'https://api.deepseek.com';
   const trimmed = url.trim().replace(/\/+$/, '');
@@ -69,7 +87,6 @@ export const config = {
 
   bot: {
     noReplyTimeoutMinutes: parseInt(process.env.NO_REPLY_TIMEOUT_MINUTES || '90', 10),
-    slaBreachHours: parseInt(process.env.SLA_BREACH_HOURS || '24', 10),
     dailyDigestCron: process.env.DAILY_DIGEST_CRON || '30 9 * * 1-5',
     showDevMetadata: process.env.SHOW_DEV_METADATA === 'true',
     timezone: BOT_TIMEZONE,
@@ -78,6 +95,20 @@ export const config = {
     /** Same topic requested this many times within the window → flag it as an automation candidate. */
     repeatThreshold: parseInt(process.env.REPEAT_REQUEST_THRESHOLD || '3', 10),
     repeatWindowDays: parseInt(process.env.REPEAT_REQUEST_WINDOW_DAYS || '30', 10),
+  },
+
+  /** SLA = "is anyone moving this?" — see src/sla.ts. Times are WORKING time in BOT_TIMEZONE. */
+  sla: {
+    highHours: numEnv('SLA_HIGH_HOURS', 8), // High: not started after this many working hours
+    mediumDays: numEnv('SLA_MEDIUM_DAYS', 2), // Medium (or no priority)
+    lowDays: numEnv('SLA_LOW_DAYS', 5),
+    staleDays: numEnv('SLA_STALE_DAYS', 3), // in progress: no activity for this many working days
+    workStart: numEnv('SLA_WORK_START', 9),
+    workEnd: numEnv('SLA_WORK_END', 18),
+    workDays: parseWorkDays(process.env.SLA_WORK_DAYS, [1, 2, 3, 4, 5]),
+    repeatDays: numEnv('SLA_REPEAT_DAYS', 3), // at most one reminder per issue per this many days
+    snoozeDays: numEnv('SLA_SNOOZE_DAYS', 3), // 💤 on a reminder
+    bigTaskFactor: 2, // effort:high gets double the time
   },
 
   report: {

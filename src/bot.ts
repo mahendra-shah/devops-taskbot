@@ -7,18 +7,22 @@ import type {
   IncomingMessageEvent,
   IssueStatus,
   PostMessageFn,
+  Priority,
   ThreadMessage,
 } from './types.js';
 import {
   formatP0Alert,
   formatStatusUpdateMessage,
+  resolveRequester,
   splitMessage,
   stripMentions,
 } from './utils/helpers.js';
-import { buildStatusMessage, isTeamMember } from './utils/workload.js';
+import { buildStatusMessage, findTeamMember, isTeamMember } from './utils/workload.js';
 import { availabilityService, type Availability } from './availability.js';
-import { logAudit, runWithAudit } from './audit.js';
+import { logAudit, runWithAudit, setRequester } from './audit.js';
+import { explainError, shouldAlertTeam, unknownMemberMessage, type FriendlyError } from './errors.js';
 import { ackThread, watchP0 } from './escalation.js';
+import { snoozeSla } from './sla.js';
 import { notifyRequesterOfClosure } from './requesterUpdates.js';
 import { recordRequestTopic, type TopicClassifier } from './topics.js';
 import * as store from './store.js';
@@ -77,6 +81,16 @@ export class DevOpsBot {
     while (this.background.size > 0) await Promise.all([...this.background]);
   }
 
+  /** User-facing text for an error; config problems also ping the team (at most once per 30 min per kind). */
+  private friendlyText(err: unknown): string {
+    const info: FriendlyError = explainError(err);
+    let text = info.userMessage;
+    if (info.notifyTeam && shouldAlertTeam(info.kind)) {
+      text += `\n🔧 ${config.team.map(m => `<@${m.slackId}>`).join(' ')} — ${info.adminHint}`;
+    }
+    return text;
+  }
+
   private async teamAvailability(): Promise<Map<string, Availability>> {
     return availabilityService.getMany(config.team.map(m => m.slackId));
   }
@@ -123,25 +137,23 @@ export class DevOpsBot {
     if (assignMatch) {
       const issueNumber = parseInt(assignMatch[1], 10);
       const newGithubUser = assignMatch[2].trim().replace(/^@/, '');
+      const member = findTeamMember(newGithubUser);
+      if (!member) {
+        await adapter.replyInThread(event.channelId, threadTs, `⚠️ ${unknownMemberMessage(newGithubUser)}`);
+        return;
+      }
       try {
-        const updated = await this.github.reassignIssue(issueNumber, newGithubUser);
+        const updated = await this.github.reassignIssue(issueNumber, member.githubUsername);
         if (!updated) {
           await adapter.replyInThread(event.channelId, threadTs, `❌ Issue #${issueNumber} not found on GitHub.`);
         } else {
-          let msg = `✓ Issue <${updated.url}|#${issueNumber}> has been reassigned to *${newGithubUser}* on GitHub.`;
-          const target = config.team.find(m => m.githubUsername.toLowerCase() === newGithubUser.toLowerCase());
-          if (target) {
-            const a = await availabilityService.get(target.slackId);
-            if (!a.available) msg += `\n🌴 Heads up: <@${target.slackId}> is out of office until *${a.untilLabel ?? 'later'}*.`;
-          }
+          let msg = `✓ Issue <${updated.url}|#${issueNumber}> has been reassigned to *${member.githubUsername}* on GitHub.`;
+          const a = await availabilityService.get(member.slackId);
+          if (!a.available) msg += `\n🌴 Heads up: <@${member.slackId}> is out of office until *${a.untilLabel ?? 'later'}*.`;
           await adapter.replyInThread(event.channelId, threadTs, msg);
         }
       } catch (err) {
-        await adapter.replyInThread(
-          event.channelId,
-          threadTs,
-          `❌ Failed to reassign issue #${issueNumber}: ${(err as Error).message}`
-        );
+        await adapter.replyInThread(event.channelId, threadTs, this.friendlyText(err));
       }
       return;
     }
@@ -155,6 +167,10 @@ export class DevOpsBot {
       if (isInsideThread) {
         threadHistory = await adapter.getThreadHistory(event.channelId, threadTs);
       }
+
+      // 1b. Who actually asked? Inside a thread that's whoever wrote its first message — not whoever tagged the bot.
+      const requester = resolveRequester(event, threadHistory, threadTs);
+      setRequester(requester.id, requester.name);
 
       // 2. Resolve any GitHub issue linked to this thread + who is out of office
       const linkedIssue = await this.resolveLinkedIssue(threadTs, threadHistory);
@@ -192,13 +208,13 @@ export class DevOpsBot {
           issueNumber: result.createdIssue.number,
           channelId: event.channelId,
           threadTs,
-          requesterId: event.userId,
+          requesterId: requester.id,
           createdAt: Date.now(),
         });
         // Repeat-request detection runs in the background — it must never delay the reply.
         this.runInBackground(
           'topic',
-          recordRequestTopic(result.createdIssue, event.userId, event.channelId, postVia(adapter), {
+          recordRequestTopic(result.createdIssue, requester.id, event.channelId, postVia(adapter), {
             classifier: this.deps.classifyTopic,
           })
         );
@@ -244,12 +260,7 @@ export class DevOpsBot {
         }
       }
     } catch (err) {
-      console.error('❌ Error processing message:', err);
-      await adapter.replyInThread(
-        event.channelId,
-        threadTs,
-        `🚨 Something went wrong while processing this message. Error: ${(err as Error).message}`
-      );
+      await adapter.replyInThread(event.channelId, threadTs, this.friendlyText(err)).catch(() => {});
     } finally {
       await adapter.removeReaction(event.channelId, event.ts, 'eyes').catch(() => {});
     }
@@ -257,7 +268,7 @@ export class DevOpsBot {
 
   private async applyPriorityChange(
     issueNumber: number,
-    priority: 'P0' | 'P1' | 'P2',
+    priority: Priority,
     event: IncomingMessageEvent,
     adapter: BotPlatformAdapter,
     threadTs: string
@@ -353,6 +364,17 @@ export class DevOpsBot {
             replyThreadTs,
             `💤 Auto-status reply snoozed for 60 minutes by <@${userId}>.`
           );
+        } else {
+          // Not a no-reply timer → maybe a reminder about the issue in this thread: snooze its SLA reminders.
+          const link = store.getIssueLinkByThread(replyThreadTs);
+          if (link) {
+            const until = snoozeSla(link.issueNumber);
+            await adapter.replyInThread(
+              channelId,
+              replyThreadTs,
+              `💤 Reminders for #${link.issueNumber} snoozed until *${until}* by <@${userId}>.`
+            );
+          }
         }
       }
       return;
@@ -401,7 +423,7 @@ export class DevOpsBot {
         store.setClosedNotified(issue.number, false);
       }
     } catch (err) {
-      console.error('❌ Error updating issue from emoji reaction:', err);
+      await adapter.replyInThread(channelId, replyThreadTs, this.friendlyText(err)).catch(() => {});
     }
   }
 

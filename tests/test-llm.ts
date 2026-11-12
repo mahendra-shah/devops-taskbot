@@ -50,7 +50,7 @@ async function testProvider(name: 'deepseek' | 'gemini') {
 
 async function main() {
   console.log('═'.repeat(60));
-  console.log('🤖 DevOps Tracker LLM Diagnostics');
+  console.log('🤖 DevOps Taskbot LLM Diagnostics');
   console.log(`   Active LLM_PROVIDER in .env: ${config.llm.provider.toUpperCase()}`);
   console.log('═'.repeat(60));
 

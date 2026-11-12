@@ -1,3 +1,8 @@
+/** P0 = Urgent, P1 = High, P2 = Medium, P3 = Low (matches the Priority options on the project board). */
+export type Priority = 'P0' | 'P1' | 'P2' | 'P3';
+export const PRIORITIES: Priority[] = ['P0', 'P1', 'P2', 'P3'];
+export const PRIORITY_NAMES: Record<Priority, string> = { P0: 'Urgent', P1: 'High', P2: 'Medium', P3: 'Low' };
+
 export type IssueStatus = 'open' | 'in-progress' | 'done' | 'blocked';
 
 export interface GitHubComment {
@@ -17,6 +22,8 @@ export interface GitHubIssue {
   createdAt: string;
   updatedAt: string;
   closedAt?: string;
+  /** GitHub login of whoever closed it (when GitHub reports it). */
+  closedBy?: string;
   comments?: GitHubComment[];
 }
 
@@ -24,7 +31,7 @@ export interface ParsedTask {
   title: string;
   body: string;
   estimate: 'low' | 'medium' | 'high';
-  priority: 'P0' | 'P1' | 'P2';
+  priority: Priority;
   type: 'task' | 'question' | 'fyi';
   summary: string;
 }
@@ -76,7 +83,7 @@ export interface GitHubProvider {
   /** Change the P0/P1/P2 and/or effort:* label of an existing issue (replaces the old one). */
   updateIssueMeta(
     issueNumber: number,
-    meta: { priority?: 'P0' | 'P1' | 'P2'; estimate?: 'low' | 'medium' | 'high' }
+    meta: { priority?: Priority; estimate?: 'low' | 'medium' | 'high' }
   ): Promise<GitHubIssue | null>;
   addIssueComment(issueNumber: number, comment: string): Promise<void>;
   addIssueLabel(issueNumber: number, label: string): Promise<void>;

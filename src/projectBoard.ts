@@ -1,53 +1,79 @@
 import { Octokit } from '@octokit/rest';
 import { config } from './config.js';
-import type { GitHubIssue } from './types.js';
+import { PRIORITIES, type GitHubIssue, type Priority } from './types.js';
 
 /**
- * GitHub Projects (v2) board sync.
+ * GitHub Projects (v2) board = source of truth for Status, Priority and Effort.
  *
- * Labels (`in-progress`, `P0`, …) and the project board's own fields (Status, Priority) are two
- * separate things on GitHub — setting a label does NOT move the card. This keeps the board in step:
- * after every change the bot makes, the issue's card gets the matching Status and Priority.
+ *   • WRITES: after every change the bot makes, the issue's card gets the matching Status / Priority /
+ *     Effort field (no `in-progress` / `P1` labels are needed — they stay off the issue).
+ *   • READS:  the bot reads the cards back (cached ~20 s), so a card dragged to "In Progress" on the board
+ *     is respected by the bot, the digest, `@bot status`, escalation, etc.
+ *   • FALLBACK: if a value can't be written (no matching column such as "Blocked", missing token scope,
+ *     API error) the bot falls back to a label so nothing is lost.
  *
- * Needs: GITHUB_PROJECT_NUMBER, and a token with the `project` scope.
- * Option names are discovered from your board (Todo / In Progress / Done …); nothing is hard-coded.
- * Best effort: a failure here is logged and never breaks the Slack flow.
+ * Needs GITHUB_PROJECT_NUMBER and a token with the `project` scope. Option names are discovered from your
+ * board (Todo / In Progress / Done, Urgent / High / Medium / Low …) — nothing is hard-coded.
  */
 
-export interface BoardSync {
-  sync(issue: GitHubIssue): Promise<void>;
-}
-
 export type BoardStatus = 'open' | 'in-progress' | 'blocked' | 'done';
-export type BoardPriority = 'P0' | 'P1' | 'P2';
+export type Effort = 'low' | 'medium' | 'high';
 
-export function deriveBoardValues(issue: Pick<GitHubIssue, 'state' | 'labels'>): {
-  status: BoardStatus;
-  priority: BoardPriority | null;
-} {
-  const status: BoardStatus =
-    issue.state === 'closed'
-      ? 'done'
-      : issue.labels.includes('blocked')
-        ? 'blocked'
-        : issue.labels.includes('in-progress')
-          ? 'in-progress'
-          : 'open';
-  const priority = (['P0', 'P1', 'P2'] as const).find(p => issue.labels.includes(p)) ?? null;
-  return { status, priority };
+export interface BoardDesired {
+  status?: BoardStatus;
+  priority?: Priority;
+  effort?: Effort;
+  estimateHours?: number;
 }
 
-const STATUS_PATTERNS: Record<BoardStatus, RegExp> = {
+/** Which of the requested values were actually written to the board. */
+export interface BoardApplyResult {
+  ok: boolean;
+  status: boolean;
+  priority: boolean;
+  effort: boolean;
+  hours: boolean;
+}
+
+export interface BoardFields {
+  status?: BoardStatus;
+  priority?: Priority;
+  effort?: Effort;
+  estimateHours?: number;
+}
+
+export interface BoardSnapshot {
+  items: Map<number, BoardFields>;
+  /** True when the board has a column that can represent "blocked". */
+  supportsBlocked: boolean;
+}
+
+export interface BoardSync {
+  readonly enabled: boolean;
+  apply(issue: GitHubIssue, desired: BoardDesired): Promise<BoardApplyResult>;
+  snapshot?(): Promise<BoardSnapshot>;
+}
+
+// ── name ⇄ value matching ──────────────────────────────────────────────────
+
+export const STATUS_PATTERNS: Record<BoardStatus, RegExp> = {
   open: /^(todo|to do|to-do|backlog|open|new|triage|ready)/i,
   'in-progress': /(progress|doing|started|active|wip)/i,
   blocked: /block|hold|waiting/i,
   done: /(done|complete|closed|shipped|resolved)/i,
 };
 
-const PRIORITY_PATTERNS: Record<BoardPriority, RegExp> = {
+export const PRIORITY_PATTERNS: Record<Priority, RegExp> = {
   P0: /\bp0\b|critical|urgent|highest|blocker/i,
   P1: /\bp1\b|^high$/i,
   P2: /\bp2\b|^(medium|normal|med)$/i,
+  P3: /\bp3\b|^low$|minor|trivial/i,
+};
+
+export const EFFORT_PATTERNS: Record<Effort, RegExp> = {
+  low: /^(low|small|xs|s|easy|quick)\b/i,
+  medium: /^(medium|med|m)\b/i,
+  high: /^(high|large|big|l|xl|hard)\b/i,
 };
 
 export interface FieldOption {
@@ -59,7 +85,45 @@ export function matchOption(options: FieldOption[], pattern: RegExp): FieldOptio
   return options.find(o => pattern.test(o.name.trim())) ?? null;
 }
 
-export { STATUS_PATTERNS, PRIORITY_PATTERNS };
+const STATUS_ORDER: BoardStatus[] = ['blocked', 'in-progress', 'done', 'open'];
+
+export function statusFromName(name: string): BoardStatus | undefined {
+  return STATUS_ORDER.find(s => STATUS_PATTERNS[s].test(name.trim()));
+}
+export function priorityFromName(name: string): Priority | undefined {
+  return PRIORITIES.find(p => PRIORITY_PATTERNS[p].test(name.trim()));
+}
+export function effortFromName(name: string): Effort | undefined {
+  return (['low', 'medium', 'high'] as Effort[]).find(e => EFFORT_PATTERNS[e].test(name.trim()));
+}
+
+const EFFORT_FIELD_RE = /^(effort|size|complexity)$/i;
+const HOURS_FIELD_RE = /^(estimate|estimated hours|hours|estimate \(?hours?\)?|effort \(?hours?\)?|time estimate)$/i;
+
+/**
+ * Applies board values on top of an issue's labels so the rest of the bot (which reasons about labels)
+ * sees the board's truth. Labels stay as the fallback where the board has no value.
+ */
+export function overlayIssue(issue: GitHubIssue, fields: BoardFields | undefined, supportsBlocked: boolean): GitHubIssue {
+  if (!fields) return issue;
+  let labels = [...issue.labels];
+  if (fields.status) {
+    labels = labels.filter(l => l !== 'in-progress' && !(supportsBlocked && l === 'blocked'));
+    if (fields.status === 'in-progress') labels.push('in-progress');
+    if (fields.status === 'blocked' && !labels.includes('blocked')) labels.push('blocked');
+  }
+  if (fields.priority) {
+    labels = labels.filter(l => !PRIORITIES.includes(l as Priority));
+    labels.push(fields.priority);
+  }
+  if (fields.effort) {
+    labels = labels.filter(l => !l.startsWith('effort:'));
+    labels.push(`effort:${fields.effort}`);
+  }
+  return { ...issue, labels };
+}
+
+// ── GitHub GraphQL implementation ──────────────────────────────────────────
 
 interface SelectField {
   id: string;
@@ -71,10 +135,13 @@ interface ProjectMeta {
   projectId: string;
   status: SelectField | null;
   priority: SelectField | null;
+  effort: SelectField | null;
+  hours: { id: string; name: string } | null;
   loadedAt: number;
 }
 
 const META_TTL_MS = 10 * 60 * 1000;
+const SNAPSHOT_TTL_MS = 20 * 1000;
 
 const FIELDS_FRAGMENT = `
   id
@@ -82,12 +149,14 @@ const FIELDS_FRAGMENT = `
     nodes {
       __typename
       ... on ProjectV2SingleSelectField { id name options { id name } }
+      ... on ProjectV2Field { id name dataType }
     }
   }`;
 
 export class ProjectBoard implements BoardSync {
   private octokit = new Octokit({ auth: config.github.token });
   private meta: ProjectMeta | null = null;
+  private snap: { at: number; value: BoardSnapshot } | null = null;
   private warned = new Set<string>();
 
   get enabled(): boolean {
@@ -125,12 +194,18 @@ export class ProjectBoard implements BoardSync {
       throw new Error(`project #${number} not found for "${owner}" (${(lastErr as Error)?.message ?? 'check GITHUB_PROJECT_NUMBER and that the token has the `project` scope'})`);
     }
 
-    const fields: SelectField[] = (project.fields.nodes as any[])
-      .filter(n => n && n.options)
-      .map(n => ({ id: n.id, name: n.name, options: n.options }));
-    const byName = (name: string) => fields.find(f => f.name.toLowerCase() === name) ?? null;
+    const nodes = (project.fields.nodes as any[]).filter(Boolean);
+    const selects: SelectField[] = nodes.filter(n => n.options).map(n => ({ id: n.id, name: n.name, options: n.options }));
+    const numbers = nodes.filter(n => n.dataType === 'NUMBER').map(n => ({ id: n.id, name: n.name as string }));
 
-    this.meta = { projectId: project.id, status: byName('status'), priority: byName('priority'), loadedAt: Date.now() };
+    this.meta = {
+      projectId: project.id,
+      status: selects.find(f => f.name.toLowerCase() === 'status') ?? null,
+      priority: selects.find(f => f.name.toLowerCase() === 'priority') ?? null,
+      effort: selects.find(f => EFFORT_FIELD_RE.test(f.name)) ?? null,
+      hours: numbers.find(f => HOURS_FIELD_RE.test(f.name)) ?? null,
+      loadedAt: Date.now(),
+    };
     return this.meta;
   }
 
@@ -157,71 +232,167 @@ export class ProjectBoard implements BoardSync {
     return added.addProjectV2ItemById.item.id;
   }
 
-  private async setField(projectId: string, itemId: string, field: SelectField, option: FieldOption): Promise<void> {
+  private async setSelect(projectId: string, itemId: string, fieldId: string, optionId: string): Promise<void> {
     await this.octokit.graphql(
       `mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
          updateProjectV2ItemFieldValue(input: {
            projectId: $projectId, itemId: $itemId, fieldId: $fieldId, value: { singleSelectOptionId: $optionId }
          }) { projectV2Item { id } }
        }`,
-      { projectId, itemId, fieldId: field.id, optionId: option.id }
+      { projectId, itemId, fieldId, optionId }
     );
   }
 
-  /** Read-only: shows what the bot found on your board and how it would map each status/priority. */
+  private async setNumber(projectId: string, itemId: string, fieldId: string, value: number): Promise<void> {
+    await this.octokit.graphql(
+      `mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $value: Float!) {
+         updateProjectV2ItemFieldValue(input: {
+           projectId: $projectId, itemId: $itemId, fieldId: $fieldId, value: { number: $value }
+         }) { projectV2Item { id } }
+       }`,
+      { projectId, itemId, fieldId, value }
+    );
+  }
+
+  async apply(issue: GitHubIssue, desired: BoardDesired): Promise<BoardApplyResult> {
+    const result: BoardApplyResult = { ok: false, status: false, priority: false, effort: false, hours: false };
+    if (!this.enabled) return result;
+    try {
+      const meta = await this.loadMeta();
+      const itemId = await this.ensureItem(issue.number, meta.projectId);
+
+      if (desired.status) {
+        const option = meta.status ? matchOption(meta.status.options, STATUS_PATTERNS[desired.status]) : null;
+        if (option) {
+          await this.setSelect(meta.projectId, itemId, meta.status!.id, option.id);
+          result.status = true;
+        } else if (!meta.status) {
+          this.warnOnce('status-field', 'the board has no single-select "Status" field — using labels for status instead');
+        } else {
+          this.warnOnce(`status:${desired.status}`, `no "Status" column matches "${desired.status}" (columns: ${meta.status.options.map(o => o.name).join(', ')}) — using a label for it instead`);
+        }
+      }
+
+      if (desired.priority) {
+        const option = meta.priority ? matchOption(meta.priority.options, PRIORITY_PATTERNS[desired.priority]) : null;
+        if (option) {
+          await this.setSelect(meta.projectId, itemId, meta.priority!.id, option.id);
+          result.priority = true;
+        } else if (!meta.priority) {
+          this.warnOnce('priority-field', 'the board has no single-select "Priority" field — using labels for priority instead');
+        } else {
+          this.warnOnce(`priority:${desired.priority}`, `no "Priority" option matches ${desired.priority} (options: ${meta.priority.options.map(o => o.name).join(', ')}) — using a label instead`);
+        }
+      }
+
+      if (desired.effort && meta.effort) {
+        const option = matchOption(meta.effort.options, EFFORT_PATTERNS[desired.effort]);
+        if (option) {
+          await this.setSelect(meta.projectId, itemId, meta.effort.id, option.id);
+          result.effort = true;
+        }
+      }
+
+      if (desired.estimateHours !== undefined) {
+        if (meta.hours) {
+          await this.setNumber(meta.projectId, itemId, meta.hours.id, desired.estimateHours);
+          result.hours = true;
+        } else {
+          this.warnOnce('hours-field', 'add a Number field named "Estimate" to the board to show estimated hours on the card (they\'re always in the issue body)');
+        }
+      }
+
+      result.ok = true;
+      this.snap = null; // our own write — next read should be fresh
+    } catch (err) {
+      this.meta = null; // refetch next time (a field/option may have been renamed)
+      console.warn(`⚠️ Project board update failed for #${issue.number}: ${(err as Error).message}`);
+    }
+    return result;
+  }
+
+  /** All cards' Status/Priority/Effort, cached for ~20 s. Throws on API failure (callers fall back to labels). */
+  async snapshot(): Promise<BoardSnapshot> {
+    if (!this.enabled) return { items: new Map(), supportsBlocked: false };
+    if (this.snap && Date.now() - this.snap.at < SNAPSHOT_TTL_MS) return this.snap.value;
+
+    const meta = await this.loadMeta();
+    const repoFull = `${config.github.owner}/${config.github.repo}`.toLowerCase();
+    const items = new Map<number, BoardFields>();
+    let cursor: string | null = null;
+
+    for (let page = 0; page < 5; page++) {
+      const res: any = await this.octokit.graphql(
+        `query($id: ID!, $cursor: String) {
+           node(id: $id) {
+             ... on ProjectV2 {
+               items(first: 100, after: $cursor) {
+                 pageInfo { hasNextPage endCursor }
+                 nodes {
+                   content { ... on Issue { number repository { nameWithOwner } } }
+                   fieldValues(first: 20) {
+                     nodes {
+                       __typename
+                       ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2FieldCommon { name } } }
+                       ... on ProjectV2ItemFieldNumberValue { number field { ... on ProjectV2FieldCommon { name } } }
+                     }
+                   }
+                 }
+               }
+             }
+           }
+         }`,
+        { id: meta.projectId, cursor }
+      );
+      const conn = res.node.items;
+      for (const node of conn.nodes as any[]) {
+        const issue = node?.content;
+        if (!issue?.number || String(issue.repository?.nameWithOwner ?? '').toLowerCase() !== repoFull) continue;
+        const fields: BoardFields = {};
+        for (const fv of (node.fieldValues?.nodes ?? []) as any[]) {
+          const fname = String(fv?.field?.name ?? '');
+          if (!fname) continue;
+          if (typeof fv.name === 'string') {
+            if (fname.toLowerCase() === 'status') fields.status = statusFromName(fv.name);
+            else if (fname.toLowerCase() === 'priority') fields.priority = priorityFromName(fv.name);
+            else if (EFFORT_FIELD_RE.test(fname)) fields.effort = effortFromName(fv.name);
+          } else if (typeof fv.number === 'number' && HOURS_FIELD_RE.test(fname)) {
+            fields.estimateHours = fv.number;
+          }
+        }
+        items.set(issue.number, fields);
+      }
+      if (!conn.pageInfo.hasNextPage) break;
+      cursor = conn.pageInfo.endCursor;
+    }
+
+    const supportsBlocked = Boolean(meta.status?.options.some(o => STATUS_PATTERNS.blocked.test(o.name)));
+    const value = { items, supportsBlocked };
+    this.snap = { at: Date.now(), value };
+    return value;
+  }
+
+  /** Read-only: shows what the bot found on your board and how it would map each value. */
   async diagnose(): Promise<string[]> {
     const out: string[] = [];
     if (!this.enabled) return ['GITHUB_PROJECT_NUMBER is not set — board sync is OFF.'];
     const meta = await this.loadMeta();
     out.push(`✓ Found project #${config.github.project.number} for "${config.github.owner}"`);
 
-    if (!meta.status) out.push('✗ No single-select field named "Status" — status will NOT sync.');
-    else {
-      out.push(`Status field options: ${meta.status.options.map(o => o.name).join(' | ')}`);
-      for (const s of Object.keys(STATUS_PATTERNS) as BoardStatus[]) {
-        const m = matchOption(meta.status.options, STATUS_PATTERNS[s]);
-        out.push(`  ${s.padEnd(12)} → ${m ? `"${m.name}"` : '✗ no matching option'}`);
+    const show = (title: string, field: SelectField | null, keys: string[], pattern: (k: any) => RegExp, missing: string) => {
+      if (!field) return out.push(`✗ ${missing}`);
+      out.push(`${title} field "${field.name}" options: ${field.options.map(o => o.name).join(' | ')}`);
+      for (const k of keys) {
+        const m = matchOption(field.options, pattern(k));
+        out.push(`  ${String(k).padEnd(12)} → ${m ? `"${m.name}"` : '✗ no matching option (a label is used instead)'}`);
       }
-    }
-    if (!meta.priority) out.push('✗ No single-select field named "Priority" — priority will NOT sync.');
-    else {
-      out.push(`Priority field options: ${meta.priority.options.map(o => o.name).join(' | ')}`);
-      for (const p of Object.keys(PRIORITY_PATTERNS) as BoardPriority[]) {
-        const m = matchOption(meta.priority.options, PRIORITY_PATTERNS[p]);
-        out.push(`  ${p.padEnd(12)} → ${m ? `"${m.name}"` : '✗ no matching option'}`);
-      }
-    }
+    };
+    show('Status', meta.status, Object.keys(STATUS_PATTERNS), k => STATUS_PATTERNS[k as BoardStatus], 'No single-select field named "Status" — status will use labels.');
+    show('Priority', meta.priority, PRIORITIES, k => PRIORITY_PATTERNS[k as Priority], 'No single-select field named "Priority" — priority will use labels.');
+    if (meta.effort) show('Effort', meta.effort, ['low', 'medium', 'high'], k => EFFORT_PATTERNS[k as Effort], '');
+    else out.push('ℹ No "Effort"/"Size" single-select field (optional) — effort stays as the effort:* label.');
+    out.push(meta.hours ? `✓ Estimated hours go to the number field "${meta.hours.name}"` : 'ℹ No number field named "Estimate" (optional) — add one to show estimated hours on the card.');
     return out;
-  }
-
-  async sync(issue: GitHubIssue): Promise<void> {
-    if (!this.enabled) return;
-    try {
-      const meta = await this.loadMeta();
-      const itemId = await this.ensureItem(issue.number, meta.projectId);
-      const { status, priority } = deriveBoardValues(issue);
-
-      if (meta.status) {
-        const option = matchOption(meta.status.options, STATUS_PATTERNS[status]);
-        if (option) await this.setField(meta.projectId, itemId, meta.status, option);
-        else this.warnOnce(`status:${status}`, `no "Status" option matches "${status}" (options: ${meta.status.options.map(o => o.name).join(', ')})`);
-      } else {
-        this.warnOnce('status-field', 'the board has no single-select "Status" field');
-      }
-
-      if (priority) {
-        if (meta.priority) {
-          const option = matchOption(meta.priority.options, PRIORITY_PATTERNS[priority]);
-          if (option) await this.setField(meta.projectId, itemId, meta.priority, option);
-          else this.warnOnce(`priority:${priority}`, `no "Priority" option matches ${priority} (options: ${meta.priority.options.map(o => o.name).join(', ')})`);
-        } else {
-          this.warnOnce('priority-field', 'the board has no single-select "Priority" field');
-        }
-      }
-    } catch (err) {
-      this.meta = null; // refetch next time (field/option may have been renamed)
-      console.warn(`⚠️ Project board sync failed for #${issue.number}: ${(err as Error).message}`);
-    }
   }
 }
 
