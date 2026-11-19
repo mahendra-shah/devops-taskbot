@@ -57,6 +57,16 @@ export const config = {
 
   github: {
     token: process.env.GITHUB_TOKEN || '',
+    /**
+     * Optional: act as an organisation-owned GitHub App instead of a person (bot actions then appear as "<app>[bot]").
+     * Needs the App ID, the installation ID, and the private key (a .pem file path, or the PEM text with \n escapes).
+     */
+    app: {
+      appId: parseInt(process.env.GITHUB_APP_ID || '0', 10) || 0,
+      installationId: parseInt(process.env.GITHUB_APP_INSTALLATION_ID || '0', 10) || 0,
+      privateKeyPath: process.env.GITHUB_APP_PRIVATE_KEY_PATH || '',
+      privateKey: process.env.GITHUB_APP_PRIVATE_KEY || '',
+    },
     owner: process.env.GITHUB_OWNER || '',
     repo: process.env.GITHUB_REPO || '',
     /** GitHub Projects v2 board to keep in sync (Status + Priority fields). 0 = disabled. */
@@ -137,7 +147,8 @@ if (!skipSlack) {
   if (!config.slack.devopsChannelId) errors.push('SLACK_DEVOPS_CHANNEL_ID');
 }
 if (!skipGithub) {
-  if (!config.github.token) errors.push('GITHUB_TOKEN');
+  const appReady = Boolean(config.github.app.appId && config.github.app.installationId && (config.github.app.privateKey || config.github.app.privateKeyPath));
+  if (!config.github.token && !appReady) errors.push('GitHub credentials: set GITHUB_APP_ID + GITHUB_APP_INSTALLATION_ID + GITHUB_APP_PRIVATE_KEY_PATH (recommended), or GITHUB_TOKEN');
   if (!config.github.owner) errors.push('GITHUB_OWNER');
   if (!config.github.repo) errors.push('GITHUB_REPO');
 }

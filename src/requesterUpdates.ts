@@ -2,6 +2,7 @@ import cron from 'node-cron';
 import * as store from './store.js';
 import { logAudit, isAuditComment } from './audit.js';
 import { slackIdForGithubUsername } from './utils/workload.js';
+import { isBotLogin } from './githubAuth.js';
 import { summarizeResolution } from './llm.js';
 import type { GitHubIssue, GitHubProvider, PostMessageFn } from './types.js';
 
@@ -63,7 +64,7 @@ export async function notifyRequesterOfClosure(
   }
 
   const assignee = issue.assignees[0];
-  const by = closerId ? ` by <@${closerId}>` : issue.closedBy ? ` by *${issue.closedBy}*` : assignee ? ` (handled by *${assignee}*)` : '';
+  const by = closerId ? ` by <@${closerId}>` : issue.closedBy && !isBotLogin(issue.closedBy) ? ` by *${issue.closedBy}*` : assignee ? ` (handled by *${assignee}*)` : '';
   const text =
     `✅ <@${link.requesterId}> your request is resolved — <${issue.url}|#${issue.number} ${issue.title}> was closed${by}.\n` +
     `_${summary}_`;

@@ -28,6 +28,7 @@
 - **Audit Trail**: Every create / status change / reassignment / escalation is logged in SQLite **and** commented on the GitHub issue (who, via what, and why this assignee).
 - **Project board = source of truth**: Status (Todo / In Progress / Done), Priority (Urgent / High / Medium / Low) and Effort/Estimate are set on your GitHub Projects card — not as labels — and the bot reads the board back, so dragging a card is respected. Falls back to labels if the board can't take a value. Optional — see `GITHUB_PROJECT_NUMBER`.
 - **Helpful errors**: plain-language explanations in the thread (never raw provider errors or key fragments); config problems ping the team once per 30 min; a startup check flags a rejected AI key.
+- **Bot identity**: run the bot as an organisation-owned **GitHub App** so its actions appear as `<app>[bot]` while people acting directly on GitHub stay under their own names — see [docs/github-app-setup.md](docs/github-app-setup.md). Until then it uses a personal token and the markers below tell bot and human apart.
 - **Bot-vs-human markers**: Because the bot uses your GitHub token, its actions are marked: `bot-created` label, a "Created by the DevOps Taskbot at the request of …" footer, 🤖 audit comments, and "Posted by the DevOps Taskbot on behalf of …" on notes it writes. Anything without a marker was done by a person directly on GitHub.
 - **Structured issues**: Every issue starts with *Priority · Effort (hours) · Requested by*, then Request / Context / Definition of done, and the original Slack message(s) collapsed. The requester is the thread's first author, not whoever tagged the bot.
 - **Weekly Report by Email**: Friday 18:00 — completed/opened/open counts, per-dev handled work + average resolution time, top requesters, repeat topics. Sent with nodemailer (not posted to Slack).
@@ -115,6 +116,9 @@ npm test
 
 # Read-only check that the bot can see your GitHub Project board and how it maps Status/Priority/Effort
 npm run check:board
+
+# Read-only check of the bot's GitHub identity (App vs token), its permissions and repo access
+npm run check:github
 
 # Print what a bot-created issue will look like (GitHub issue + board card + Slack messages), no real GitHub touched
 npm run preview:issue

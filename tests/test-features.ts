@@ -1,17 +1,23 @@
 process.env.SKIP_SLACK_VALIDATION = 'true';
 process.env.STATE_DB_PATH = ':memory:'; // tests never touch the real state DB
 
+import { githubAuthMode, loadPrivateKey, createOctokit, describeGithubIdentity, isBotLogin } from '../src/githubAuth.js';
+import { generateKeyPairSync } from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import nodemailer from 'nodemailer';
 import { config } from '../src/config.js';
 import { DevOpsBot, type AgentRunner } from '../src/bot.js';
 import * as store from '../src/store.js';
 import { AuditedGitHubProvider, AUDIT_MARKER, BOT_NOTE_MARKER, runWithAudit } from '../src/audit.js';
-import { overlayIssue, matchOption, statusFromName, priorityFromName, effortFromName, STATUS_PATTERNS } from '../src/projectBoard.js';
+import { overlayIssue, matchOption, statusFromName, priorityFromName, effortFromName, STATUS_PATTERNS, PRIORITY_PATTERNS, EFFORT_PATTERNS } from '../src/projectBoard.js';
 import { FakeBoard } from './fake-board.js';
 import { explainError, shouldAlertTeam, resetAlertsForTests, LlmUnavailableError } from '../src/errors.js';
 import { fetchTeamWorkload } from '../src/utils/workload.js';
 import { setIssueExtras } from '../src/audit.js';
-import type { GitHubIssue } from '../src/types.js';
+import type { GitHubIssue, ThreadMessage } from '../src/types.js';
+import { pickRequester, resolveRequester, threadParticipants } from '../src/utils/helpers.js';
 import {
   availabilityService,
   evaluateAvailability,
@@ -582,6 +588,17 @@ async function testBoardAndMarkers() {
   );
   assert(statusFromName('Todo') === 'open' && statusFromName('In Progress') === 'in-progress' && statusFromName('Done') === 'done', 'Status options Todo / In Progress / Done map correctly');
   assert(effortFromName('Small') === 'low' && effortFromName('Medium') === 'medium' && effortFromName('XL') === 'high', 'effort options map (Small/Medium/XL)');
+  const orgPriority = [{ id: '1', name: 'High' }, { id: '2', name: 'Low' }, { id: '3', name: 'Medium' }, { id: '4', name: 'Urgent' }];
+  const orgEffort = [{ id: '1', name: 'High' }, { id: '2', name: 'Low' }, { id: '3', name: 'Medium' }];
+  assert(
+    matchOption(orgPriority, PRIORITY_PATTERNS.P0)?.name === 'Urgent' && matchOption(orgPriority, PRIORITY_PATTERNS.P1)?.name === 'High' &&
+      matchOption(orgPriority, PRIORITY_PATTERNS.P2)?.name === 'Medium' && matchOption(orgPriority, PRIORITY_PATTERNS.P3)?.name === 'Low',
+    'the organisation\'s real "Priority" issue-field options (High, Low, Medium, Urgent — in that order) map P0→Urgent, P1→High, P2→Medium, P3→Low'
+  );
+  assert(
+    matchOption(orgEffort, EFFORT_PATTERNS.low)?.name === 'Low' && matchOption(orgEffort, EFFORT_PATTERNS.medium)?.name === 'Medium' && matchOption(orgEffort, EFFORT_PATTERNS.high)?.name === 'High',
+    'the real "Effort" issue-field options (High, Low, Medium) map low/medium/high'
+  );
   assert(matchOption([{ id: '1', name: 'Todo' }, { id: '2', name: 'In Progress' }, { id: '3', name: 'Done' }], STATUS_PATTERNS.blocked) === null, 'a 3-column board has no "Blocked" → bot uses a label for blocked');
 
   const base = { number: 1, labels: ['devops', 'P2', 'in-progress', 'effort:low'] } as GitHubIssue;
@@ -869,6 +886,10 @@ async function testSla() {
     await h.slack.sendMessage({ userId: A, userName: 'dev-a', text: 'looking at it', threadTs: t }); // clears the no-reply timer
     await h.slack.react(t, 'zzz', B);
     assert(h.repliesIn(t).some(x => x.includes('snoozed until')), '💤 snoozes the reminders and says until when');
+    // The reaction snoozes from the REAL clock; pin it to this test's own timeline so the test never depends on today's date.
+    const snoozed = store.getSlaState(1)!;
+    snoozed.snoozedUntilMs = at(2026, 11, 11, 10) + cfg.snoozeDays * 86_400_000;
+    store.saveSlaState(snoozed);
     await runSlaCheck(h.github, poster, at(2026, 11, 13, 10), cfg);
     assert(count() === 1, 'no reminder while snoozed');
     await runSlaCheck(h.github, poster, at(2026, 11, 16, 10), cfg);
@@ -889,6 +910,15 @@ async function testSla() {
     assert(etaMsgs.length === 1 && etaMsgs[0].includes(`<@${A}>`), 'after the ETA passes → ONE "ETA has passed" nudge');
     await runSlaCheck(h.github, poster, at(2026, 11, 16, 11), cfg);
     assert(h.repliesIn(t).filter(x => x.includes('has passed')).length === 1, 'the ETA nudge is not repeated');
+  }
+
+  banner('N5b. An ETA is also written to the issue\'s "Target date" field');
+  {
+    const h = boardHarness();
+    await h.slack.sendMessage({ ...REQ, text: '@bot please add a Loki dashboard for the queue' });
+    await runWithAudit({ actorId: A, actorName: 'dev-a', via: 'test' }, () => setIssueEta(h.github, 1, etaEndOfDayMs('2026-11-13', TZ)!));
+    assert(h.board.cards.get(1)!.targetDate === '2026-11-13', '"@bot #1 will take till Friday" → Target date = 2026-11-13 on the issue');
+    assert((await h.github.getIssueByNumber(1)) !== null && h.board.applyCalls.some(c => c.desired.targetDate === '2026-11-13'), 'it went through the same board/audit path as other changes');
   }
 
   banner('N6. Assignee out of office → the clock pauses');
@@ -940,6 +970,107 @@ async function testSla() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// M3. The thread starter is not always the requester
+// ═══════════════════════════════════════════════════════════════════════════
+async function testThreadRequester() {
+  banner('M3. Souvik starts the thread ("share your requirements"), Prakash asks, Mahendra says "@bot add this"');
+  const history = [
+    { role: 'user', senderName: 'Souvik Deb', senderId: 'USOUVIK01', content: 'Hey Prakash, you can share your requirements here.', ts: '1.1' },
+    { role: 'user', senderName: 'Prakash Dey', senderId: 'UPRAKASH01', content: 'We need some help with domain and Amplify setup. Two repos, two Amplify apps...', ts: '1.2' },
+    { role: 'user', senderName: 'Mahendra', senderId: A, content: 'How urgent is this?', ts: '1.3' },
+    { role: 'user', senderName: 'Prakash Dey', senderId: 'UPRAKASH01', content: 'This is urgent', ts: '1.4' },
+  ] as ThreadMessage[];
+
+  const parts = threadParticipants(history);
+  assert(parts.length === 3 && parts[1].id === 'UPRAKASH01' && parts[1].text.includes('Amplify') && parts[1].text.includes('This is urgent'), 'participants: one entry per person, holding everything they wrote');
+  const fallback = resolveRequester({ userId: A, userName: 'Mahendra', text: '@bot add this' }, history, '1.1');
+  assert(fallback.id === 'USOUVIK01', 'the plain "thread starter" rule alone would have picked Souvik');
+  const picked = pickRequester(parts, 'UPRAKASH01', fallback);
+  assert(picked.id === 'UPRAKASH01' && picked.text.includes('Amplify'), 'the AI-chosen requester (Prakash) wins, and the quoted text is HIS messages');
+  assert(pickRequester(parts, '<@UPRAKASH01>', fallback).id === 'UPRAKASH01', 'a Slack mention form is accepted too');
+  assert(pickRequester(parts, 'UNOTINTHREAD1', fallback).id === 'USOUVIK01', 'an ID that did not take part in the thread is rejected → falls back');
+  assert(pickRequester(parts, undefined, fallback).id === 'USOUVIK01', 'no choice made → fallback');
+
+  // Through the bot: the agent names Prakash → link, audit and the "resolved" message all use Prakash
+  store.resetDbForTests();
+  const mock = new MockGitHubProvider(false);
+  const github = new AuditedGitHubProvider(mock);
+  const runner: AgentRunner = async params => {
+    const r = await mockAgentRunner(params);
+    return r.createdIssue ? { ...r, requester: { id: 'UPRAKASH01', name: 'Prakash Dey' } } : r;
+  };
+  const bot = new DevOpsBot(github, runner, { classifyTopic: async () => null });
+  const slack = new SimulatedSlackEnvironment(bot, github, true);
+  for (const m of config.team) slack.setProfile(m.slackId, { statusText: '', statusEmoji: '', statusExpiration: 0, displayName: m.githubUsername, realName: m.githubUsername });
+
+  const t = await slack.sendMessage({ userId: 'USOUVIK01', userName: 'Souvik Deb', text: 'Hey Prakash, you can share your requirements here.' });
+  await slack.sendMessage({ userId: 'UPRAKASH01', userName: 'Prakash Dey', text: 'We need help with domain and Amplify setup. This is urgent.', threadTs: t });
+  await slack.sendMessage({ userId: A, userName: 'dev-a', text: '@bot could you add this to github?', threadTs: t });
+  assert(store.getIssueLink(1)?.requesterId === 'UPRAKASH01', 'the issue is linked to Prakash, not Souvik');
+  await slack.react(t, 'white_check_mark', B);
+  const resolved = slack.capturedReplies.filter(r => r.threadTs === t && r.text.includes('your request is resolved')).map(r => r.text);
+  assert(resolved.length === 1 && resolved[0].includes('<@UPRAKASH01>') && !resolved[0].includes('<@USOUVIK01>'), '"your request is resolved" tags Prakash — and not Souvik');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// O. GitHub identity: organisation App vs personal token
+// ═══════════════════════════════════════════════════════════════════════════
+async function testGithubIdentity() {
+  banner('O1. Which identity is used: App, token, or nothing');
+  const saved = { token: config.github.token, app: { ...config.github.app } };
+  const noApp = { appId: 0, installationId: 0, privateKeyPath: '', privateKey: '' };
+  try {
+    config.github.token = 'ghp_example';
+    config.github.app = { ...noApp };
+    assert(githubAuthMode() === 'token' && describeGithubIdentity().includes('personal access token'), 'only a token configured → "token" mode, and the startup log warns that actions appear under a person');
+
+    config.github.app = { appId: 1234567, installationId: 87654321, privateKeyPath: '', privateKey: 'k' };
+    assert(githubAuthMode() === 'app' && describeGithubIdentity().includes('GitHub App #1234567'), 'App configured → "app" mode (it wins over the token)');
+
+    config.github.app = { appId: 1234567, installationId: 0, privateKeyPath: '', privateKey: 'k' };
+    assert(githubAuthMode() === 'token', 'a half-configured App (no installation ID) is ignored → falls back to the token');
+
+    config.github.token = '';
+    config.github.app = { ...noApp };
+    assert(githubAuthMode() === 'none', 'nothing configured → "none"');
+
+    banner('O2. Private key loading');
+    config.github.app = { ...noApp, privateKey: '-----BEGIN KEY-----\\nabc\\n-----END KEY-----' };
+    assert(loadPrivateKey() === '-----BEGIN KEY-----\nabc\n-----END KEY-----', 'key pasted into .env with \\n escapes → real line breaks');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gh-app-'));
+    const file = path.join(dir, 'app.pem');
+    fs.writeFileSync(file, 'PEM-FROM-FILE');
+    config.github.app = { ...noApp, privateKeyPath: file };
+    assert(loadPrivateKey() === 'PEM-FROM-FILE', 'key read from the .pem file path');
+    config.github.app = { ...noApp, privateKeyPath: path.join(dir, 'missing.pem') };
+    let message = '';
+    try { loadPrivateKey(); } catch (e) { message = (e as Error).message; }
+    assert(message.includes('Could not read the GitHub App private key') && message.includes('missing.pem'), 'a wrong path gives a clear error naming the file');
+    fs.rmSync(dir, { recursive: true, force: true });
+
+    banner('O3. The App client mints a valid App token (offline, throwaway key)');
+    const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048, privateKeyEncoding: { type: 'pkcs8', format: 'pem' }, publicKeyEncoding: { type: 'spki', format: 'pem' } });
+    config.github.app = { appId: 1234567, installationId: 87654321, privateKeyPath: '', privateKey };
+    const octokit = createOctokit();
+    const jwt = (await octokit.auth({ type: 'app' })) as { token: string; type: string };
+    assert(jwt.type === 'app' && jwt.token.split('.').length === 3, 'with an App configured, the client signs a real 3-part JWT from the private key');
+    assert(typeof octokit.rest.issues.create === 'function' && typeof octokit.graphql === 'function', 'same client serves both the REST API (issues) and GraphQL (project board)');
+  } finally {
+    config.github.token = saved.token;
+    config.github.app = saved.app;
+  }
+
+  banner('O4. Bot logins are not shown as people');
+  assert(isBotLogin('navg-taskbot[bot]') && !isBotLogin('mahendra-shah') && !isBotLogin(undefined), '"name[bot]" is recognised as a bot login');
+  const h = setup();
+  const t = await h.slack.sendMessage({ ...REQ, text: '@bot please add a Grafana panel for disk usage' });
+  h.mock.closeDirectly(1, 'navg-taskbot[bot]');
+  await runClosurePoll(h.github, h.slack.createPoster());
+  const msg = h.slack.capturedReplies.filter(r => r.threadTs === t && r.text.includes('your request is resolved')).map(r => r.text)[0] ?? '';
+  assert(msg.includes(`<@${REQ.userId}>`) && !msg.includes('[bot]') && msg.includes('handled by'), 'closed by the bot itself → message names the assignee ("handled by …"), not "navg-taskbot[bot]"');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 
 async function main() {
   testAvailabilityParsing();
@@ -955,7 +1086,9 @@ async function main() {
   await testBoardAndMarkers();
   await testFriendlyErrors();
   await testRealRequester();
+  await testThreadRequester();
   await testSla();
+  await testGithubIdentity();
   console.log(`\n🎉 ALL ${passed} FEATURE CHECKS PASSED!\n`);
   process.exit(0);
 }

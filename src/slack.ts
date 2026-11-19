@@ -15,6 +15,7 @@ import {
 import { startSlaChecker } from './sla.js';
 import { AuditedGitHubProvider } from './audit.js';
 import { liveProjectBoard } from './projectBoard.js';
+import { describeGithubIdentity } from './githubAuth.js';
 import { checkLlmProviders } from './llm.js';
 import { availabilityService, describeAvailability, profileFromSlackUser } from './availability.js';
 import { ackThread, startEscalationChecker } from './escalation.js';
@@ -129,6 +130,8 @@ export async function startSlackBot(): Promise<void> {
     appToken: config.slack.appToken,
     socketMode: true,
   });
+
+  console.log(describeGithubIdentity());
 
   // Every create / status change / reassignment made through this provider is audited
   // (SQLite log + a comment on the GitHub issue).

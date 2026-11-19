@@ -17,9 +17,12 @@
     "clean": "rm -rf dist dist-tests",
     "test:features": "npm run build:tests && node dist-tests/tests/test-features.js",
     "check:board": "npm run build:tests && node dist-tests/tests/check-board.js",
-    "preview:issue": "npm run build:tests && node dist-tests/tests/preview-issue.js"
+    "preview:issue": "npm run build:tests && node dist-tests/tests/preview-issue.js",
+    "check:github": "npm run build:tests && node dist-tests/tests/check-github.js",
+    "selftest:github": "npm run build:tests && node dist-tests/tests/selftest-github.js"
   },
   "dependencies": {
+    "@octokit/auth-app": "^8.3.1",
     "@octokit/rest": "^20.1.1",
     "@slack/bolt": "^3.21.2",
     "better-sqlite3": "^13.0.3",

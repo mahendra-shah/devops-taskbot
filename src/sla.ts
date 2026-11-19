@@ -222,6 +222,10 @@ export async function setIssueEta(github: GitHubProvider, issueNumber: number, e
   store.saveSlaState(state);
   const label = formatLocalDate(etaMs);
   await auditIssueEvent(github, issueNumber, 'sla.eta_set', `ETA set to **${label}** — reminders paused until then`);
+  // Mirror it on GitHub's "Target date" field so the whole team sees it (best effort).
+  const p = localParts(etaMs);
+  const iso = `${p.y}-${String(p.m).padStart(2, '0')}-${String(p.d).padStart(2, '0')}`;
+  await github.setTargetDate?.(issueNumber, iso).catch(err => console.warn(`⚠️ Could not set Target date on #${issueNumber}: ${(err as Error).message}`));
   return label;
 }
 

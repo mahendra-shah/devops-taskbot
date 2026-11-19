@@ -1,10 +1,10 @@
-import { Octokit } from '@octokit/rest';
 import { config } from './config.js';
+import { createOctokit } from './githubAuth.js';
 import type { GitHubIssue, GitHubProvider, IssueStatus, ParsedTask, Priority } from './types.js';
 
 export type { GitHubIssue, ParsedTask } from './types.js';
 
-const octokit = new Octokit({ auth: config.github.token });
+const octokit = createOctokit();
 const { owner, repo } = config.github;
 
 /**
@@ -48,7 +48,7 @@ export async function createIssue(
     repo,
     title: task.title,
     body: bodyWithSource,
-    assignees: [assigneeGithubUsername],
+    assignees: assigneeGithubUsername ? [assigneeGithubUsername] : [], // empty = unassigned
     labels,
   });
 

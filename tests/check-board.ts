@@ -11,6 +11,6 @@ liveProjectBoard
   })
   .catch(err => {
     console.error('\n✗ Could not read the project board:', err.message);
-    console.error('  Check GITHUB_PROJECT_NUMBER, GITHUB_OWNER, and that GITHUB_TOKEN has the `project` scope.\n');
+    console.error('  Check GITHUB_PROJECT_NUMBER, GITHUB_OWNER, and that the GitHub App has the Projects permission (or the token has the `project` scope).\n');
     process.exit(1);
   });

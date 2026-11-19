@@ -167,7 +167,7 @@ export class AuditedGitHubProvider implements GitHubProvider {
     const board = this.board;
     if (!board?.snapshot || issues.length === 0) return issues;
     try {
-      const snap = await board.snapshot();
+      const snap = await board.snapshot(issues.map(i => i.number));
       return issues.map(i => overlayIssue(i, snap.items.get(i.number), snap.supportsBlocked));
     } catch (err) {
       if (!this.warnedOverlay) {
@@ -295,6 +295,14 @@ export class AuditedGitHubProvider implements GitHubProvider {
       return { ...updated, labels: [...updated.labels, meta.priority] };
     }
     return updated;
+  }
+
+  /** Put an ETA on the issue's "Target date" field (best effort — the board never throws). */
+  async setTargetDate(issueNumber: number, isoDate: string): Promise<void> {
+    const board = this.board;
+    if (!board) return;
+    const issue = await this.inner.getIssueByNumber(issueNumber);
+    if (issue) await board.apply(issue, { targetDate: isoDate });
   }
 
   async addIssueComment(issueNumber: number, comment: string): Promise<void> {

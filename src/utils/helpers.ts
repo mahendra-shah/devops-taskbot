@@ -144,3 +144,36 @@ export function slackToPlain(text: string, nameOf?: (slackId: string) => string 
     .replace(/&gt;/g, '>')
     .replace(/&amp;/g, '&');
 }
+
+export interface ThreadParticipant {
+  id: string;
+  name: string;
+  /** Everything this person wrote in the thread (capped), oldest first. */
+  text: string;
+}
+
+/** Human authors in a thread, in order of first appearance, with their messages joined. */
+export function threadParticipants(history: ThreadMessage[]): ThreadParticipant[] {
+  const byId = new Map<string, ThreadParticipant>();
+  for (const m of history) {
+    if (m.role !== 'user' || !m.senderId) continue;
+    const p = byId.get(m.senderId) ?? { id: m.senderId, name: m.senderName, text: '' };
+    p.text = (p.text ? `${p.text}\n\n` : '') + m.content;
+    byId.set(m.senderId, p);
+  }
+  return [...byId.values()].map(p => ({ ...p, text: p.text.slice(0, 3000) }));
+}
+
+/**
+ * The AI names who actually asked for the work (e.g. the person who described the need, not the teammate who
+ * first tagged others). Only accepted if they really took part in the thread; otherwise use the fallback.
+ */
+export function pickRequester<T extends { id: string; name: string; text: string }>(
+  participants: ThreadParticipant[],
+  chosenSlackId: string | undefined,
+  fallback: T
+): { id: string; name: string; text: string; fromThreadRoot: boolean } {
+  const chosen = chosenSlackId ? participants.find(p => p.id === chosenSlackId.trim().replace(/^<@|>$/g, '')) : undefined;
+  if (chosen) return { id: chosen.id, name: chosen.name, text: chosen.text, fromThreadRoot: true };
+  return { id: fallback.id, name: fallback.name, text: fallback.text, fromThreadRoot: (fallback as any).fromThreadRoot ?? false };
+}

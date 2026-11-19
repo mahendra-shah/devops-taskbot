@@ -202,7 +202,12 @@ export class DevOpsBot {
         await this.postOooNotice(event, adapter, threadTs, availability, result, assignedMember?.slackId);
       }
 
-      // 6. Remember which Slack thread/requester this issue belongs to (for closure updates)
+      // 6. Remember which Slack thread/requester this issue belongs to (for closure updates).
+      //    The AI may have picked a different person than the thread's first author (who actually described the need).
+      if (result.requester) {
+        requester.id = result.requester.id;
+        requester.name = result.requester.name;
+      }
       if (result.createdIssue) {
         store.saveIssueLink({
           issueNumber: result.createdIssue.number,

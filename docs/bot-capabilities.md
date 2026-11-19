@@ -95,7 +95,7 @@ While you're away you get **no new assignments**, aren't timed for replies, and 
 
 ## 3. The project board is the source of truth
 
-Status, Priority and Effort live on your GitHub Projects board (**DevOps queries**), **not** in labels:
+**Status** lives on your GitHub Projects board (**DevOps queries**); **Priority, Effort and Target date** are GitHub *issue fields* (the "Fields" section of an issue). None of them are labels:
 
 | In Slack / bot | On the board |
 |---|---|
@@ -103,6 +103,7 @@ Status, Priority and Effort live on your GitHub Projects board (**DevOps queries
 | 👀 | Status **In Progress** |
 | ✅ | Status **Done** (and the issue is closed) |
 | `@bot make this urgent` | Priority **Urgent** |
+| `@bot #1 will take till Friday` | **Target date** = that Friday |
 
 - **It works both ways.** If someone drags a card on the board, the bot sees it — load scores, `@bot status`, the digest and P0 escalation all follow the board.
 - **No `in-progress` / `P1` label clutter.** Labels left on an issue are only `devops`, `bot-created` and `effort:*`.
@@ -165,7 +166,7 @@ The bot no longer nags just because an issue is old. It reminds people when an i
 - Anything stuck also shows in the **Needs attention** section of the daily digest.
 
 **Controls — so the bot never nags about something expected**
-- `@bot #1 will take till Friday` (team only) records an **ETA**. No reminders until that day has passed; then one "the ETA has passed — done, or set a new one?" nudge. The ETA is also written on the issue as an audit comment.
+- `@bot #1 will take till Friday` (team only) records an **ETA**. No reminders until that day has passed; then one "the ETA has passed — done, or set a new one?" nudge. The ETA is also written on the issue as an audit comment and to its **Target date** field.
 - React 💤 on the thread (team only) to snooze that issue's reminders for **3 days**.
 - Moving the card or posting an update resets the silence clock.
 
@@ -176,7 +177,7 @@ The bot no longer nags just because an issue is old. It reminds people when an i
 ## 6. Transparency and safety
 
 - **Audit trail.** Every create, status change, priority/effort change, reassignment and escalation is written to a SQLite log *and* as a 🤖 comment on the GitHub issue: who asked, via what (message / reaction), and why.
-- **Bot vs. human.** The bot uses a teammate's GitHub token, so its actions appear under that person's name. They're marked: `bot-created` label, a "Created by the DevOps Taskbot at the request of …" footer, 🤖 audit comments (who asked, via what, why), and "Posted by the DevOps Taskbot on behalf of …" on notes it writes. **Anything without a marker was done by a person on GitHub.**
+- **Bot vs. human.** Run as an **organisation GitHub App** (see [github-app-setup.md](github-app-setup.md)), bot actions appear as `<app>[bot]` and anything a person does directly on GitHub stays under their own name. Until the App is set up, the bot uses a teammate's token, so its actions appear under that person's name. They're marked: `bot-created` label, a "Created by the DevOps Taskbot at the request of …" footer, 🤖 audit comments (who asked, via what, why), and "Posted by the DevOps Taskbot on behalf of …" on notes it writes. **Anything without a marker was done by a person on GitHub.**
 - **Survives restarts.** Timers, thread↔issue links and escalation watches are stored in `data/devops-tracker.db`.
 - **Fails safe.** If Slack profiles can't be read, everyone counts as available. If the project board can't be read or written, the bot falls back to labels and Slack carries on.
 - **Helpful errors.** Failures are explained in plain language in the thread — never raw provider text or key fragments. Setup problems (AI key rejected, no AI credit, bad GitHub token) also ping the team once per 30 minutes with what to check; every error has a short `ref` that matches the server log. Asking for a person who isn't in `TEAM_MEMBERS` gets a clear "I don't know X — here's who I can assign to" instead of a silent substitution.
@@ -191,7 +192,7 @@ The bot no longer nags just because an issue is old. It reminds people when an i
 - Natural-language **status** changes via `@bot` aren't restricted to the team (emoji and priority/effort changes are). Easy to tighten.
 - Only people in `TEAM_MEMBERS` can be assigned. The bot can't see other GitHub users.
 - A Google Calendar "Out of Office" event synced into Slack status counts as OOO.
-- Actions appear under one person's GitHub account until a separate bot account/App is set up.
+- Until the GitHub App is set up ([guide](github-app-setup.md)), actions appear under one person's GitHub account.
 - Timers are stored on the machine the bot runs on; moving servers starts with an empty database.
 
 **Ideas not built yet**

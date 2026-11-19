@@ -93,6 +93,8 @@ export interface GitHubProvider {
   findIssueBySlackTs(slackTs: string): Promise<GitHubIssue | null>;
   findSimilarOpenIssue(title: string): Promise<GitHubIssue | null>;
   countClosedYesterday(): Promise<number>;
+  /** Write the issue's "Target date" (the ETA) where the platform supports it. Optional. */
+  setTargetDate?(issueNumber: number, isoDate: string): Promise<void>;
   /** Issues closed at or after `sinceIso` (used by the weekly report). */
   getClosedSince(sinceIso: string): Promise<GitHubIssue[]>;
 }

@@ -8,10 +8,10 @@ import type {
   ThreadMessage,
 } from './types.js';
 import { fetchTeamWorkload, findTeamMember, isTeamMember, type TeamWorkload } from './utils/workload.js';
-import { isAuditComment, setAssignmentNote, setIssueExtras } from './audit.js';
+import { isAuditComment, setAssignmentNote, setIssueExtras, setRequester } from './audit.js';
 import { PRIORITIES, PRIORITY_NAMES, type Priority } from './types.js';
 import { LlmUnavailableError, unknownMemberMessage, type ProviderFailure } from './errors.js';
-import { resolveRequester, slackToPlain } from './utils/helpers.js';
+import { pickRequester, resolveRequester, slackToPlain, threadParticipants } from './utils/helpers.js';
 import type { Availability } from './availability.js';
 import { etaEndOfDayMs, setIssueEta } from './sla.js';
 
@@ -27,6 +27,8 @@ export interface AgentResult {
   assignedGithubUsername?: string;
   /** Issue numbers the agent closed (status → done) during this run. */
   closedIssueNumbers?: number[];
+  /** Who actually asked for the work on the issue created in this run (may differ from who tagged the bot). */
+  requester?: { id: string; name: string };
   /** Priority changes the agent made on existing issues (drives P0 escalation start/stop). */
   priorityChanges?: { issueNumber: number; priority: Priority }[];
 }
@@ -205,6 +207,10 @@ const AGENT_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
             type: 'string',
             description: 'Exact GitHub username from the configured team list, chosen by lowest workload unless explicitly requested.',
           },
+          requested_by_slack_id: {
+            type: 'string',
+            description: 'When inside a thread: the Slack ID (from THREAD PARTICIPANTS) of the person who actually described the need — NOT a teammate who is just logging it, and NOT someone who only invited others to share details. Omit if unclear.',
+          },
         },
         required: ['title', 'body', 'priority', 'estimate', 'estimate_hours', 'assignee_github_username'],
       },
@@ -376,6 +382,7 @@ ${openIssuesSummary}
 
 CURRENT CONTEXT:
 - TODAY: ${new Date().toLocaleDateString('en-GB', { timeZone: config.bot.timezone, weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })} (${new Date().toLocaleDateString('en-CA', { timeZone: config.bot.timezone })}, ${config.bot.timezone})
+- THREAD PARTICIPANTS (Slack ID — name): ${isInsideThread ? (threadParticipants(threadHistory).map(p => `${p.id} — ${p.name}`).join('; ') || '(none)') : '(not in a thread)'}
 - Message location: ${isInsideThread ? 'INSIDE AN EXISTING SLACK THREAD' : 'NEW ROOT CHANNEL MESSAGE'}
 - Bot explicitly tagged (@bot): ${event.isBotMentioned ? 'YES' : 'NO (a team member was tagged instead)'}
 - Sender: ${event.userName} (${event.userId})${linkedIssueContext}
@@ -428,6 +435,7 @@ BEHAVIOR RULES:
   let createdTaskPriority: Priority | undefined;
   let assignedGithubUsername: string | undefined;
   const closedIssueNumbers: number[] = [];
+  let createdRequester: { id: string; name: string } | undefined;
   const priorityChanges: { issueNumber: number; priority: Priority }[] = [];
 
   const MAX_TURNS = 6;
@@ -440,9 +448,9 @@ BEHAVIOR RULES:
     if (!toolCalls || toolCalls.length === 0) {
       const text = (choice.content || '').trim();
       if (!text || text === 'NO_REPLY') {
-        return { replyText: null, createdIssue, createdTaskPriority, assignedGithubUsername, closedIssueNumbers, priorityChanges };
+        return { replyText: null, createdIssue, createdTaskPriority, assignedGithubUsername, closedIssueNumbers, priorityChanges, requester: createdRequester };
       }
-      return { replyText: text, createdIssue, createdTaskPriority, assignedGithubUsername, closedIssueNumbers, priorityChanges };
+      return { replyText: text, createdIssue, createdTaskPriority, assignedGithubUsername, closedIssueNumbers, priorityChanges, requester: createdRequester };
     }
 
     // Append assistant's tool call request
@@ -510,7 +518,12 @@ BEHAVIOR RULES:
             setAssignmentNote(choice.note);
             setIssueExtras({ estimateHours });
             const threadRoot = event.threadTs || event.ts;
-            const requester = resolveRequester(event, threadHistory, threadRoot);
+            const fallbackRequester = resolveRequester(event, threadHistory, threadRoot);
+            const requester = isInsideThread
+              ? pickRequester(threadParticipants(threadHistory), String(args.requested_by_slack_id || ''), fallbackRequester)
+              : fallbackRequester;
+            setRequester(requester.id, requester.name); // audit trail + issue link use the real requester
+            createdRequester = { id: requester.id, name: requester.name };
             const nameOf = (id: string) => config.team.find(m => m.slackId === id)?.githubUsername;
             const issue = await github.createIssue(
               {
@@ -652,6 +665,7 @@ BEHAVIOR RULES:
     assignedGithubUsername,
     closedIssueNumbers,
     priorityChanges,
+    requester: createdRequester,
   };
 }
 

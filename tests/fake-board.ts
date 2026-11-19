@@ -18,6 +18,7 @@ interface Card {
   priority?: string;
   effort?: string;
   hours?: number;
+  targetDate?: string;
 }
 
 /**
@@ -36,7 +37,7 @@ export class FakeBoard implements BoardSync {
 
   async apply(issue: GitHubIssue, desired: BoardDesired): Promise<BoardApplyResult> {
     this.applyCalls.push({ issue: issue.number, desired });
-    const res: BoardApplyResult = { ok: false, status: false, priority: false, effort: false, hours: false };
+    const res: BoardApplyResult = { ok: false, status: false, priority: false, effort: false, hours: false, targetDate: false };
     if (this.failing) return res;
 
     const card = this.cards.get(issue.number) ?? {};
@@ -62,12 +63,16 @@ export class FakeBoard implements BoardSync {
       card.hours = desired.estimateHours;
       res.hours = true;
     }
+    if (desired.targetDate) {
+      card.targetDate = desired.targetDate;
+      res.targetDate = true;
+    }
     this.cards.set(issue.number, card);
     res.ok = true;
     return res;
   }
 
-  async snapshot(): Promise<BoardSnapshot> {
+  async snapshot(_issueNumbers?: number[]): Promise<BoardSnapshot> {
     if (this.failing) throw new Error('board unavailable');
     const items = new Map<number, BoardFields>();
     for (const [n, c] of this.cards) {
@@ -76,6 +81,7 @@ export class FakeBoard implements BoardSync {
         priority: c.priority ? priorityFromName(c.priority) : undefined,
         effort: c.effort ? effortFromName(c.effort) : undefined,
         estimateHours: c.hours,
+        targetDate: c.targetDate,
       });
     }
     return { items, supportsBlocked: this.statusOptions.some(o => STATUS_PATTERNS.blocked.test(o)) };

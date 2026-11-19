@@ -119,10 +119,10 @@ export function explainError(err: unknown, opts: { log?: boolean } = {}): Friend
   // Octokit (GitHub) errors carry an HTTP status and a `response`
   if (typeof status === 'number' && String((err as any)?.response?.url ?? '').includes('github')) {
     if (status === 401) {
-      return make('github_auth', `GitHub rejected the bot’s access token, so I couldn’t update the issue. I’ve flagged it for the DevOps team. ${retry}`, 'GITHUB_TOKEN is invalid/expired (HTTP 401).', true);
+      return make('github_auth', `GitHub rejected the bot’s credentials, so I couldn’t update the issue. I’ve flagged it for the DevOps team. ${retry}`, 'GitHub credentials rejected (HTTP 401): check GITHUB_APP_ID / GITHUB_APP_INSTALLATION_ID / the private key (or GITHUB_TOKEN if no App).', true);
     }
     if (status === 403) {
-      return make('github_forbidden', 'GitHub refused that action (permissions or rate limit). Please try again shortly.', 'GitHub returned 403 — check token scopes (repo, project) and rate limits.');
+      return make('github_forbidden', 'GitHub refused that action (permissions or rate limit). Please try again shortly.', 'GitHub returned 403 — check the App permissions (Issues: write, Projects: write) or token scopes, and rate limits.');
     }
     if (status === 404) {
       return make('github_not_found', 'I couldn’t find that on GitHub — the issue number may be wrong, or the bot can’t see that repo.', 'GitHub returned 404 — check the issue number, GITHUB_OWNER/GITHUB_REPO and token access.');

@@ -5,3 +5,5 @@ dist-tests/
 *.log
 .DS_Store
 data/
+secrets/
+*.pem
